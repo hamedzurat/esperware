@@ -33,6 +33,52 @@ variable rename to `input_state` committed as edit
 `e-438eefd7-3a72-49e2-88c7-7d8116caa8ff` at revision 6, with decompilation
 complete. Final pseudocode retained the body and showed the renamed function
 and local. The MCP session did not save the program.
+That first MCP pass hit the fixture's startup stub. A second pass targeted the
+actual C `transform` function at `0040116d`. Initial pseudocode was:
+
+```c
+void FUN_0040116d(uint param_1,int param_2)
+{
+  uint local_c;
+
+  local_c = FUN_00401129(param_1,param_2);
+  if ((local_c & 3) == 0) {
+    local_c = local_c + param_2;
+  }
+  else {
+    local_c = local_c ^ param_1 >> 3;
+  }
+  FUN_00401129(local_c,param_1);
+  return;
+}
+```
+
+The function rename to `transform_for_agent` committed as edit
+`e-d4ca9bfa-7ab8-4bd5-a0d6-9fd924bcba05` (revision 3 → 4; decompilation
+complete). Reinspection returned the fresh variable ref `v:49:4`. The local
+rename to `transformed_state` committed as edit
+`e-30c41dd7-282f-40ec-afc4-c53607615c75` (revision 4 → 6; decompilation
+complete). Final pseudocode was:
+
+```c
+void transform_for_agent(uint param_1,int param_2)
+{
+  uint transformed_state;
+
+  transformed_state = FUN_00401129(param_1,param_2);
+  if ((transformed_state & 3) == 0) {
+    transformed_state = transformed_state + param_2;
+  }
+  else {
+    transformed_state = transformed_state ^ param_1 >> 3;
+  }
+  FUN_00401129(transformed_state,param_1);
+  return;
+}
+```
+
+The MCP session did not save this program.
+
 - `./gradlew clean test extensionZip` passed, including hypothesis event-store
   history/withdrawal tests and extension packaging.
 
