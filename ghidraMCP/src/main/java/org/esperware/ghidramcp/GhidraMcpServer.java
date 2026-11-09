@@ -13,7 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Registers only the five approved student-facing MCP tools. */
+/** Registers the student-facing MCP tools. */
 final class GhidraMcpServer implements AutoCloseable {
     private final McpSyncServer server;
     private final Gson gson = new Gson();
@@ -34,15 +34,25 @@ final class GhidraMcpServer implements AutoCloseable {
                         "contract_version", integer(), "action", enumeration("open", "status", "close"),
                         "program", string(), "session_id", string(), "generation", integer(),
                         "expected_revision", integer())), sessions::programSession));
-        result.add(tool("inspect_function", "Inspect one function, bounded pseudocode, callers, callees, xrefs, and revision-bound variables.",
+        result.add(tool("inspect_function", "Inspect one function, bounded pseudocode, callers, callees, xrefs, revision-bound variables, and referenced globals.",
                 schema(List.of("contract_version", "session_id", "generation", "expected_revision", "function_address"), Map.of(
                         "contract_version", integer(), "session_id", string(), "generation", integer(),
                         "expected_revision", integer(), "function_address", string(), "cursor", string())), sessions::inspect));
-        result.add(tool("edit_function", "Commit one rename, comment, type, or signature change, then refresh decompilation.",
+        result.add(tool("search_pseudocode", "Find functions by name, signature, or decompiled pseudocode text.",
+                schema(List.of("contract_version", "session_id", "generation", "expected_revision", "query", "match_in"), Map.of(
+                        "contract_version", integer(), "session_id", string(), "generation", integer(),
+                        "expected_revision", integer(), "query", string(),
+                        "match_in", enumeration("name", "signature", "pseudocode", "all"), "cursor", string())), sessions::searchPseudocode));
+        result.add(tool("search_types", "Find existing program types; structures include bounded field layout details.",
+                schema(List.of("contract_version", "session_id", "generation", "expected_revision", "query"), Map.of(
+                        "contract_version", integer(), "session_id", string(), "generation", integer(),
+                        "expected_revision", integer(), "query", string(), "cursor", string())), sessions::searchTypes));
+        result.add(tool("edit_function", "Edit a function, local variable, or referenced global. For variable/global targets, use the matching revision-bound reference from inspect_function; types accept an existing Ghidra type path or type expression.",
                 schema(List.of("contract_version", "session_id", "generation", "expected_revision", "target", "change"), Map.of(
                         "contract_version", integer(), "session_id", string(), "generation", integer(),
                         "expected_revision", integer(), "target", objectSchema(Map.of(
-                                "kind", enumeration("function", "variable"), "function_address", string(), "variable_ref", string()), List.of("kind", "function_address")),
+                                "kind", enumeration("function", "variable", "global"), "function_address", string(),
+                                "variable_ref", string(), "global_ref", string()), List.of("kind", "function_address")),
                         "change", objectSchema(Map.of("kind", enumeration("rename", "comment", "type", "signature"), "value", string()), List.of("kind", "value")))), sessions::edit));
         result.add(tool("save_program", "Save live program changes without advancing the revision.",
                 schema(List.of("contract_version", "session_id", "generation", "expected_revision"), Map.of(

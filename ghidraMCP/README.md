@@ -16,9 +16,11 @@ Set `GHIDRA_INSTALL_DIR` before starting the MCP client. `program_session(open)`
 
 ## Contract
 
-The server exposes exactly five MCP tools: `program_session`, `inspect_function`, `edit_function`, `save_program`, and `revert_last_edit`. Hypothesis events are an internal Java store interface for the trusted harness; there are no student-callable hypothesis tools.
+The server exposes seven MCP tools: `program_session`, `inspect_function`, `search_pseudocode`, `search_types`, `edit_function`, `save_program`, and `revert_last_edit`. Hypothesis events are an internal Java store interface for the trusted harness; there are no student-callable hypothesis tools.
 
 All requests use `contract_version: 1`. Open-program operations carry the session id, generation, and expected revision. Function addresses are entry addresses. Variable references are valid only at the inspection revision that created them. After mutation, inspect again before using variable references.
+
+`inspect_function` includes referenced globals as well as local variables. Both expose revision-bound references: pass `variable_ref` or `global_ref` with the function entry address to `edit_function`. `search_pseudocode` searches function names, signatures, or decompiled text in bounded pages. `search_types` finds existing types by name or category path; structures and unions include field names, offsets, and field types. To apply a type, pass its Ghidra data type path (for example, `/mytypes/Player`) as the `type` change value. Global type changes update Ghidra's data-type listing and preserve comments; they do not write raw bytes, and are limited to fixed-size types no larger than the existing defined data.
 
 An edit commits in one Ghidra transaction before cache flush and decompilation. The response separates `edit_status` from `decompile_status`; never repeat a committed edit because the decompilation timed out. Save does not advance revision. Revert is limited to the latest eligible edit.
 

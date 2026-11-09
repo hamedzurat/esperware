@@ -2,6 +2,14 @@
 
 Environment: Ghidra 12.2 PUBLIC, Temurin 25.0.5+8, Linux x86-64.
 
+## Pseudocode tool handler probe
+
+- Rebuilt `readability-fixture.elf` with a referenced two-field global state and created `/Probe/ProbeState` on that global in a disposable Ghidra project.
+- Ran `RuntimeMcpToolsProbe.java` against the current extension JAR and a real headless Ghidra program. Pseudocode search found the function using `probe_state`; type search returned both struct fields at offsets 0 and 4; inspection returned the global reference and `/Probe/ProbeState` path.
+- Renamed the global, verified the name in the refreshed inspection/pseudocode, and reverted it. Changed its type from the 8-byte struct to `uint`, then reverted it. Changed and reverted its comment. All edits committed and decompilation completed; the final inspection restored the original name, struct type, and comment.
+- The type-revert probe exposed a bug: the revert compared the original struct size to the scalar's smaller current size. The implementation now records the original data extent and uses it when restoring the type. The probe passes with this fix.
+- This probe invokes the Ghidra service handlers directly. It does not verify MCP JSON-RPC tool discovery/calls over stdio; that transport probe remains open.
+
 ## Completed
 
 - Built the stripped fixture with `fixtures/build-fixture.sh`.

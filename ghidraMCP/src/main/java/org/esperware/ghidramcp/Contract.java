@@ -7,6 +7,10 @@ final class Contract {
     static final int NAVIGATION_PAGE_SIZE = 50;
     static final int PSEUDOCODE_PAGE_SIZE = 16_000;
     static final int DECOMPILE_TIMEOUT_SECONDS = 30;
+    static final int SEARCH_FUNCTIONS_PER_PAGE = 20;
+    static final int SEARCH_DECOMPILE_TIMEOUT_SECONDS = 1;
+    static final int TYPES_PER_PAGE = 20;
+    static final int TYPE_COMPONENTS_PER_TYPE = 100;
 
     private Contract() {}
 
