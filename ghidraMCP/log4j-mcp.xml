@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration packages="log">
+  <Appenders>
+    <Console name="mcp-safe-console" target="SYSTEM_ERR">
+      <PatternLayout pattern="%-5p %m (%c{1}) %ex %n"/>
+    </Console>
+    <Console name="detail" target="SYSTEM_ERR">
+      <PatternLayout pattern="%-5p %m (%c{1}) %ex %n"/>
+    </Console>
+    <Console name="script" target="SYSTEM_ERR">
+      <PatternLayout pattern="%-5p %m (%c{1}) %ex %n"/>
+    </Console>
+    <LogPanelAppender name="logPanel">
+      <PatternLayout pattern="%-5p %m %ex"/>
+    </LogPanelAppender>
+  </Appenders>
+  <Loggers>
+    <Root level="INFO">
+      <AppenderRef ref="mcp-safe-console"/>
+      <AppenderRef ref="logPanel"/>
+    </Root>
+  </Loggers>
+</Configuration>

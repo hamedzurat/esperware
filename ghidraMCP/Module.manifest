@@ -1,0 +1,4 @@
+MODULE FILE LICENSE: license/LICENSE
+MODULE FILE VERSION: 0.1.0
+MODULE FILE DESCRIPTION: Persistent Ghidra MCP for bounded pseudocode inspection, safe edits, and durable hypotheses.
+MODULE FILE AUTHOR: Esperware

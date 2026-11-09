@@ -1,0 +1,61 @@
+plugins {
+    id 'java'
+}
+
+group = 'org.esperware.ghidramcp'
+version = '0.1.0'
+
+def ghidraInstallDir = providers.gradleProperty('GHIDRA_INSTALL_DIR')
+        .orElse(providers.environmentVariable('GHIDRA_INSTALL_DIR'))
+        .orNull
+
+if (!ghidraInstallDir) {
+    throw new GradleException('Set GHIDRA_INSTALL_DIR to a Ghidra 12.2 installation directory.')
+}
+
+def ghidraHome = file(ghidraInstallDir)
+if (!new File(ghidraHome, 'Ghidra').isDirectory()) {
+    throw new GradleException("GHIDRA_INSTALL_DIR does not contain Ghidra/: ${ghidraHome}")
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly fileTree(dir: new File(ghidraHome, 'Ghidra'), includes: ['**/*.jar'])
+    implementation 'io.modelcontextprotocol.sdk:mcp:2.1.0'
+    implementation 'org.xerial:sqlite-jdbc:3.50.3.0'
+    implementation 'com.google.code.gson:gson:2.13.2'
+
+    testImplementation platform('org.junit:junit-bom:5.13.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 25
+    options.encoding = 'UTF-8'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+tasks.register('extensionZip', Zip) {
+    dependsOn tasks.jar
+    archiveBaseName = 'ghidraMCP'
+    archiveVersion = project.version
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+
+    from(tasks.jar) { into 'lib' }
+    from(configurations.runtimeClasspath) { into 'lib' }
+    from('Module.manifest')
+    from('extension.properties')
+    from('../LICENSE') { into 'license'; rename { 'LICENSE' } }
+}
