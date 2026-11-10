@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import urllib.request
 
 
 TOOLS = {
@@ -51,6 +52,8 @@ class McpContainer(unittest.TestCase):
             [
                 engine, "run", "--rm", "-i",
                 "--name", f"ghidra-mcp-test-{os.getpid()}",
+                "-e", "GHIDRA_MCP_HISTORY_HOST=0.0.0.0",
+                "-p", "127.0.0.1::8765",
                 "-v", f"{cls.data_dir}:/data", image,
                 "/data/projects/DockerMcp.gpr:/readability-fixture.elf",
             ],
@@ -207,6 +210,7 @@ class McpContainer(unittest.TestCase):
         })
         self.assertTrue(edit["ok"], edit)
         self.assertEqual(edit["decompile_status"], "complete", edit)
+        self.assertEqual(edit["history_status"], "recorded", edit)
         _, updated = self.call_tool("inspect_function", {
             **identity, "expected_revision": edit["revision"], "function_address": address
         })
@@ -217,6 +221,15 @@ class McpContainer(unittest.TestCase):
             "edit_id": edit["edit_id"],
         })
         self.assertTrue(reverted["ok"], reverted)
+        self.assertEqual(reverted["history_status"], "recorded", reverted)
+        engine = os.environ.get("CONTAINER_ENGINE", "podman")
+        mapping = subprocess.check_output([engine, "port", f"ghidra-mcp-test-{os.getpid()}", "8765/tcp"], text=True).strip()
+        port = int(mapping.rsplit(":", 1)[1])
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/edits") as response:
+            history = json.load(response)["edits"]
+        self.assertEqual([entry["operation"] for entry in history], ["edit", "revert"])
+        self.assertIn("Docker MCP integration test", history[0]["after_code"])
+        self.assertNotIn("Docker MCP integration test", history[1]["after_code"])
         _, saved = self.call_tool("save_program", {
             **identity, "expected_revision": reverted["revision"]
         })

@@ -49,3 +49,35 @@ The real-runtime fixture workflow is documented in `docs/runtime-probes.md`. The
 ## MCP client configuration
 
 Configure your MCP host to run `launch-mcp.sh` with `GHIDRA_INSTALL_DIR` set to the extracted Ghidra 12.2 directory. The host owns the launched process and its stdio connection. Ghidra opens its project UI; use that same instance for the selected project. A second MCP process cannot attach to an already-running Ghidra GUI process.
+
+## Edit history API
+
+The running plugin records each committed MCP edit and revert in SQLite and serves
+read-only JSON on `http://127.0.0.1:8765`. Each record contains the project and
+program, session and revision, edit ID, operation, target/change (for edits), and
+full before/after pseudocode. `before_status` and `after_status` identify failed
+or timed-out decompilation; the corresponding code is absent when unavailable.
+The database records changes from the time this version is installed. GUI edits,
+analysis changes, and earlier edits are not recorded. A global edit can affect
+other functions; the captured pseudocode is for the function supplied to MCP.
+
+- `GET /api/v1/edits?after=0&limit=50` lists entries in ascending ID order.
+  `after` is an exclusive ID cursor and `limit` is 1–100. Optional exact-match
+  `project`, `program`, and `function_address` query parameters filter results.
+  The response contains `edits` and `next_after`.
+- `GET /api/v1/edits/{id}` returns one entry, or 404.
+
+Set `GHIDRA_MCP_HISTORY_DB` to choose the database path (default:
+`~/.ghidra/ghidraMCP/history.sqlite`; container default: `/data/history.sqlite`).
+Set `GHIDRA_MCP_HISTORY_PORT` to change port 8765. The server binds to loopback
+unless `GHIDRA_MCP_HISTORY_HOST` is set. For a container, publish a host-local
+port and bind inside the container, for example add
+`-e GHIDRA_MCP_HISTORY_HOST=0.0.0.0 -p 127.0.0.1:8765:8765` to `docker run`.
+Persist `/data` to retain history. The API has no authentication; do not expose
+it to untrusted networks. A browser UI on another origin needs a same-origin
+backend proxy; the API does not grant cross-origin access.
+
+Edit and revert responses include `history_status`. If it is `failed`, the Ghidra
+edit still committed; do not retry the edit. Ghidra transactions and SQLite writes
+are separate, so a crash between them can also leave a gap in history. Saving the
+Ghidra project remains separate from recording history.

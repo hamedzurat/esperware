@@ -52,6 +52,7 @@ import java.util.UUID;
 final class GhidraSessionService {
     private final ProgramManager programs;
     private final Project project;
+    private final EditHistory history;
     private Program activeProgram;
     private final Gson gson = new Gson();
     private final Map<String, Variable> variableReferences = new HashMap<>();
@@ -63,8 +64,13 @@ final class GhidraSessionService {
     private EditRecord latestEdit;
 
     GhidraSessionService(ProgramManager programs, Project project) {
+        this(programs, project, null);
+    }
+
+    GhidraSessionService(ProgramManager programs, Project project, EditHistory history) {
         this.programs = programs;
         this.project = project;
+        this.history = history;
     }
 
     synchronized void setActiveProgram(Program program) {
@@ -430,6 +436,8 @@ final class GhidraSessionService {
         if (changeKind.equals("type") && !List.of("variable", "global").contains(targetKind)) {
             throw new Contract.McpFault("INVALID_CHANGE", "type changes require a variable or global target", revision());
         }
+        if (history != null) decompiler.flushCache();
+        Map<String, Object> before = history == null ? Map.of("status", "unavailable") : decompileStatus(function);
         long beforeRevision = revision();
         EditRecord record = capture(function, variable, global, targetKind, changeKind);
         int transaction = program.startTransaction("MCP " + changeKind);
@@ -458,6 +466,7 @@ final class GhidraSessionService {
         result.put("decompile_status", decompile.get("status"));
         if (decompile.containsKey("error")) result.put("decompile_error", decompile.get("error"));
         result.put("previous_revision", beforeRevision);
+        recordHistory(result, function, newRevision, "edit", record.id, target, change, before, decompile);
         return result;
     }
 
@@ -484,6 +493,8 @@ final class GhidraSessionService {
         GlobalReference global = latestEdit.targetKind.equals("global")
                 ? globalBySymbolId(latestEdit.symbolId, latestEdit.globalAddress, function) : null;
         EditRecord reverting = latestEdit;
+        if (history != null) decompiler.flushCache();
+        Map<String, Object> before = history == null ? Map.of("status", "unavailable") : decompileStatus(function);
         int transaction = program.startTransaction("Revert MCP edit " + editId);
         try {
             applyPrevious(function, variable, global, reverting);
@@ -505,7 +516,22 @@ final class GhidraSessionService {
         result.put("revert_status", "committed");
         result.put("decompile_status", decompile.get("status"));
         if (decompile.containsKey("error")) result.put("decompile_error", decompile.get("error"));
+        recordHistory(result, function, newRevision, "revert", editId, null, null, before, decompile);
         return result;
+    }
+
+    private void recordHistory(Map<String, Object> result, Function function, long rev, String operation,
+            String editId, Object target, Object change, Map<String, Object> before, Map<String, Object> after) {
+        if (history == null) return;
+        try {
+            history.append(project.getProjectLocator().toString(), program.getDomainFile().getPathname(),
+                    sessionId, generation, rev, operation, editId, function.getEntryPoint().toString(),
+                    target, change, before, after);
+            result.put("history_status", "recorded");
+        } catch (Exception failure) {
+            result.put("history_status", "failed");
+            result.put("history_error", failure.getMessage() == null ? failure.toString() : failure.getMessage());
+        }
     }
 
     private void apply(Function function, Variable variable, GlobalReference global,
@@ -755,7 +781,7 @@ final class GhidraSessionService {
         try {
             DecompileResults result = decompiler.decompileFunction(function,
                     Contract.DECOMPILE_TIMEOUT_SECONDS, TaskMonitor.DUMMY);
-            if (result != null && result.decompileCompleted()) return Map.of("status", "complete");
+            if (result != null && result.decompileCompleted()) return Map.of("status", "complete", "code", result.getDecompiledFunction().getC());
             String status = result != null && result.isTimedOut() ? "timed_out" : "failed";
             return Map.of("status", status, "error", result == null ? "No decompile result" : result.getErrorMessage());
         } catch (Exception failure) {

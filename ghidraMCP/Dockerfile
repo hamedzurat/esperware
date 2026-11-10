@@ -32,6 +32,6 @@ COPY ghidraMCP/docker/_code_browser.tcd /root/.config/ghidra/ghidra_12.2_PUBLIC/
 RUN mkdir -p /root/.config/ghidra/ghidra_12.2_PUBLIC \
     && printf 'USER_AGREEMENT=ACCEPT\n' > /root/.config/ghidra/ghidra_12.2_PUBLIC/preferences \
     && chmod +x /opt/ghidraMCP/launch-mcp.sh /opt/ghidraMCP/entrypoint.sh
-ENV GHIDRA_INSTALL_DIR=/opt/ghidra
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra GHIDRA_MCP_HISTORY_DB=/data/history.sqlite
 WORKDIR /data
 ENTRYPOINT ["/opt/ghidraMCP/entrypoint.sh"]

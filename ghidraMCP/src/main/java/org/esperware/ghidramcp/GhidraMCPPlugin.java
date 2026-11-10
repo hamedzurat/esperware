@@ -18,6 +18,7 @@ import ghidra.util.Msg;
 public final class GhidraMCPPlugin extends ProgramPlugin {
     private GhidraMcpServer mcp;
     private GhidraSessionService sessions;
+    private EditHistory history;
 
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
@@ -28,7 +29,12 @@ public final class GhidraMCPPlugin extends ProgramPlugin {
         try {
             ProgramManager programManager = tool.getService(ProgramManager.class);
             Project project = tool.getProject();
-            sessions = new GhidraSessionService(programManager, project);
+            String path = System.getenv().getOrDefault("GHIDRA_MCP_HISTORY_DB",
+                    java.nio.file.Path.of(System.getProperty("user.home"), ".ghidra", "ghidraMCP", "history.sqlite").toString());
+            int port = Integer.parseInt(System.getenv().getOrDefault("GHIDRA_MCP_HISTORY_PORT", "8765"));
+            history = new EditHistory(java.nio.file.Path.of(path),
+                    System.getenv().getOrDefault("GHIDRA_MCP_HISTORY_HOST", "127.0.0.1"), port);
+            sessions = new GhidraSessionService(programManager, project, history);
             sessions.setActiveProgram(currentProgram);
             mcp = new GhidraMcpServer(sessions);
         } catch (Exception failure) {
@@ -50,6 +56,9 @@ public final class GhidraMCPPlugin extends ProgramPlugin {
     @Override
     protected void dispose() {
         if (mcp != null) mcp.close();
+        if (history != null) {
+            try { history.close(); } catch (Exception failure) { Msg.error(this, "Could not close history", failure); }
+        }
         super.dispose();
     }
 }
