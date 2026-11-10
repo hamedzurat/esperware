@@ -206,6 +206,11 @@ class McpContainer(unittest.TestCase):
             "change": {"kind": "comment", "value": "Docker MCP integration test"},
         })
         self.assertTrue(edit["ok"], edit)
+        self.assertEqual(edit["decompile_status"], "complete", edit)
+        _, updated = self.call_tool("inspect_function", {
+            **identity, "expected_revision": edit["revision"], "function_address": address
+        })
+        self.assertIn("Docker MCP integration test", updated["pseudocode"], updated)
         _, reverted = self.call_tool("revert_last_edit", {
             **identity,
             "expected_revision": edit["revision"],

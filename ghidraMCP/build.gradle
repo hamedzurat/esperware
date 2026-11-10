@@ -30,7 +30,6 @@ repositories {
 dependencies {
     compileOnly fileTree(dir: new File(ghidraHome, 'Ghidra'), includes: ['**/*.jar'])
     implementation 'io.modelcontextprotocol.sdk:mcp:2.1.0'
-    implementation 'org.xerial:sqlite-jdbc:3.50.3.0'
     implementation 'com.google.code.gson:gson:2.13.2'
 
     testImplementation platform('org.junit:junit-bom:5.13.4')

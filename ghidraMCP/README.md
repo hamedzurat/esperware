@@ -12,7 +12,7 @@ GHIDRA_INSTALL_DIR=/path/to/ghidra ./gradlew extensionZip
 
 The output is `build/distributions/ghidraMCP-0.1.0.zip`. Install it through **File → Install Extensions**, restart Ghidra, and enable the `GhidraMCPPlugin` in the CodeBrowser tool configuration. Then configure the MCP client to launch Ghidra through `launch-mcp.sh`; do not connect a second stdio server to an already-running GUI process.
 
-Set `GHIDRA_INSTALL_DIR` before starting the MCP client. `program_session(open)` takes the project-relative program path. Hypothesis events are stored in `~/.ghidra/ghidraMCP/hypotheses.sqlite` by default; `GHIDRA_MCP_STORE` overrides that path.
+Set `GHIDRA_INSTALL_DIR` before starting the MCP client. `program_session(open)` takes the project-relative program path.
 
 ## Docker
 
@@ -32,11 +32,13 @@ Run the Docker integration test with `python3 -m unittest discover -s tests -v`.
 
 ## Contract
 
-The server exposes seven MCP tools: `program_session`, `inspect_function`, `search_pseudocode`, `search_types`, `edit_function`, `save_program`, and `revert_last_edit`. Hypothesis events are an internal Java store interface for the trusted harness; there are no student-callable hypothesis tools.
+The server exposes seven MCP tools: `program_session`, `inspect_function`, `search_pseudocode`, `search_types`, `edit_function`, `save_program`, and `revert_last_edit`.
 
 All requests use `contract_version: 1`. Open-program operations carry the session id, generation, and expected revision. Function addresses are entry addresses. Variable references are valid only at the inspection revision that created them. After mutation, inspect again before using variable references.
 
 `inspect_function` includes referenced globals as well as local variables. Both expose revision-bound references: pass `variable_ref` or `global_ref` with the function entry address to `edit_function`. `search_pseudocode` searches function names, signatures, or decompiled text in bounded pages. `search_types` finds existing types by name or category path; structures and unions include field names, offsets, and field types. To apply a type, pass its Ghidra data type path (for example, `/mytypes/Player`) as the `type` change value. Global type changes update Ghidra's data-type listing and preserve comments; they do not write raw bytes, and are limited to fixed-size types no larger than the existing defined data.
+
+To annotate pseudocode, call `edit_function` with target `{"kind":"function","function_address":"<entry>"}` and change `{"kind":"comment","value":"<your note>"}`. The comment replaces the existing function comment and appears above the function in refreshed pseudocode. Save the program to persist it. Variable and global comments are also supported on their respective targets.
 
 An edit commits in one Ghidra transaction before cache flush and decompilation. The response separates `edit_status` from `decompile_status`; never repeat a committed edit because the decompilation timed out. Save does not advance revision. Revert is limited to the latest eligible edit.
 
