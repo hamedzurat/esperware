@@ -14,6 +14,22 @@ The output is `build/distributions/ghidraMCP-0.1.0.zip`. Install it through **Fi
 
 Set `GHIDRA_INSTALL_DIR` before starting the MCP client. `program_session(open)` takes the project-relative program path. Hypothesis events are stored in `~/.ghidra/ghidraMCP/hypotheses.sqlite` by default; `GHIDRA_MCP_STORE` overrides that path.
 
+## Docker
+
+Build from the repository root and run the image as an MCP stdio process:
+
+```sh
+docker build -t ghidra-mcp:local -f ghidraMCP/Dockerfile .
+docker run --rm -i -v ghidra-mcp-data:/data ghidra-mcp:local \
+  /data/projects/MyProject.gpr:/program/path
+```
+
+The image builds the MCP extension from this source tree. It downloads the official Ghidra 12.2 runtime during the image build and verifies its SHA-256 checksum; it does not download a prebuilt MCP extension. The Dockerfile pins the runtime release and checksum. Ghidra itself can be built from source, but that requires its full Gradle source-build toolchain and substantially increases build time and complexity.
+
+The image enables `GhidraMCPPlugin` in its CodeBrowser tool configuration. Pass Ghidra 12.2's `project.gpr:/project/path` argument so it opens the CodeBrowser tool and starts MCP. Mount persistent project storage at `/data`. The container uses Xvfb for Ghidra's UI runtime and keeps MCP JSON-RPC on stdin/stdout; logs go to stderr. Each container owns one Ghidra process and one stdio MCP connection.
+
+Run the Docker integration test with `python3 -m unittest discover -s tests -v`. It builds `fixtures/readability-fixture.c`, imports it into a disposable container project, then initializes MCP over stdio and exercises all seven tools, including edit, save, revert, and close. Set `CONTAINER_ENGINE=docker` to use Docker instead of the default Podman engine.
+
 ## Contract
 
 The server exposes seven MCP tools: `program_session`, `inspect_function`, `search_pseudocode`, `search_types`, `edit_function`, `save_program`, and `revert_last_edit`. Hypothesis events are an internal Java store interface for the trusted harness; there are no student-callable hypothesis tools.

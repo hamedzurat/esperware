@@ -11,7 +11,7 @@ import java.nio.file.Path;
 
 @PluginInfo(
         status = PluginStatus.RELEASED,
-        packageName = "CodeViewer",
+        packageName = "Ghidra Core",
         category = "Data",
         shortDescription = "Persistent Ghidra MCP",
         description = "Exposes the contract-v1 MCP tools over stdio from the owning Ghidra runtime.",
@@ -19,6 +19,7 @@ import java.nio.file.Path;
         servicesProvided = {HypothesisEvents.class})
 public final class GhidraMCPPlugin extends ProgramPlugin implements HypothesisEvents {
     private GhidraMcpServer mcp;
+    private GhidraSessionService sessions;
     private HypothesisEventStore hypothesisStore;
 
     public GhidraMCPPlugin(PluginTool tool) {
@@ -35,12 +36,23 @@ public final class GhidraMCPPlugin extends ProgramPlugin implements HypothesisEv
             hypothesisStore = new HypothesisEventStore(storePath);
             ProgramManager programManager = tool.getService(ProgramManager.class);
             Project project = tool.getProject();
-            GhidraSessionService sessions = new GhidraSessionService(programManager, project);
+            sessions = new GhidraSessionService(programManager, project);
+            sessions.setActiveProgram(currentProgram);
             mcp = new GhidraMcpServer(sessions);
         } catch (Exception failure) {
             Msg.showError(this, tool.getToolFrame(), "Ghidra MCP failed to start", failure.getMessage());
             Msg.error(this, "Ghidra MCP failed to start", failure);
         }
+    }
+
+    @Override
+    protected void programActivated(ghidra.program.model.listing.Program program) {
+        if (sessions != null) sessions.setActiveProgram(program);
+    }
+
+    @Override
+    protected void programDeactivated(ghidra.program.model.listing.Program program) {
+        if (sessions != null) sessions.setActiveProgram(currentProgram);
     }
 
     /** Trusted harness integration; intentionally not registered as an MCP tool. */

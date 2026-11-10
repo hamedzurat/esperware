@@ -52,6 +52,7 @@ import java.util.UUID;
 final class GhidraSessionService {
     private final ProgramManager programs;
     private final Project project;
+    private Program activeProgram;
     private final Gson gson = new Gson();
     private final Map<String, Variable> variableReferences = new HashMap<>();
     private final Map<String, GlobalReference> globalReferences = new HashMap<>();
@@ -64,6 +65,10 @@ final class GhidraSessionService {
     GhidraSessionService(ProgramManager programs, Project project) {
         this.programs = programs;
         this.project = project;
+    }
+
+    synchronized void setActiveProgram(Program program) {
+        activeProgram = program;
     }
 
     synchronized Map<String, Object> programSession(Map<String, Object> args) throws Exception {
@@ -84,7 +89,19 @@ final class GhidraSessionService {
         DomainFile file = project.getProjectData().getFile(programPath);
         if (file == null) throw new Contract.McpFault("PROGRAM_NOT_FOUND", "No project program at " + programPath, null);
         closeDecompiler();
-        program = programs.openProgram(file, ProgramManager.OPEN_CURRENT);
+        Program active = activeProgram;
+        if (active == null) active = programs.getCurrentProgram();
+        if (active == null || !active.getDomainFile().getPathname().equals(file.getPathname())) {
+            active = null;
+            for (Program openProgram : programs.getAllOpenPrograms()) {
+                if (openProgram.getDomainFile().getPathname().equals(file.getPathname())) {
+                    active = openProgram;
+                    break;
+                }
+            }
+        }
+        if (active != null) programs.openProgram(active, ProgramManager.OPEN_CURRENT);
+        program = active != null ? active : programs.openProgram(file, ProgramManager.OPEN_CURRENT);
         if (program == null) throw new Contract.McpFault("PROGRAM_OPEN_FAILED", "Ghidra could not open " + programPath, null);
         decompiler = new DecompInterface();
         decompiler.openProgram(program);
@@ -566,8 +583,8 @@ final class GhidraSessionService {
         record.functionAddress = function.getEntryPoint().toString();
         record.targetKind = targetKind;
         record.changeKind = changeKind;
-        record.symbolId = global != null ? global.symbol.getID()
-                : variable == null ? null : variable.getSymbol().getID();
+        if (global != null) record.symbolId = global.symbol.getID();
+        else if (variable != null) record.symbolId = variable.getSymbol().getID();
         if (global != null) {
             record.globalAddress = global.data.getAddress().toString();
             record.globalLength = global.data.getLength();
