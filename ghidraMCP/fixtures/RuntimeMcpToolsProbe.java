@@ -3,6 +3,7 @@ import ghidra.app.services.ProgramManager;
 import ghidra.framework.model.Project;
 import ghidra.program.model.listing.Program;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
 import java.net.URL;
 import java.net.URLClassLoader;
@@ -62,6 +63,8 @@ public class RuntimeMcpToolsProbe extends GhidraScript {
 
         Map<String,Object> inspection = inspect(functionAddress);
         Map<String,Object> global = global(inspection, "probe_state");
+        Map<String,Object> initialVariable = list(inspection, "variables").getFirst();
+        Map<String,Object> initialIdentity = new LinkedHashMap<>(identity);
         if (!"/Probe/ProbeState".equals(global.get("data_type_path"))) {
             throw new IllegalStateException("wrong starting global type: " + global);
         }
@@ -74,6 +77,23 @@ public class RuntimeMcpToolsProbe extends GhidraScript {
             throw new IllegalStateException("renamed global absent from pseudocode: " + renamedCode);
         }
         println("MCP_TOOL_PROBE renamed_pseudocode=" + renamedCode);
+
+        Map<String,Object> staleGlobalTarget = Map.of("kind", "global", "function_address", functionAddress,
+                "global_ref", global.get("reference"));
+        expectFault("edit", withIdentity(Map.of("target", staleGlobalTarget,
+                "change", Map.of("kind", "comment", "value", "must not apply"))), "STALE_REFERENCE");
+        Map<String,Object> staleRevisionArgs = withIdentity(Map.of("target", staleGlobalTarget,
+                "change", Map.of("kind", "comment", "value", "must not apply")));
+        staleRevisionArgs.put("expected_revision", initialIdentity.get("expected_revision"));
+        expectFault("edit", staleRevisionArgs, "STALE_REVISION");
+        Map<String,Object> staleVariableTarget = Map.of("kind", "variable", "function_address", functionAddress,
+                "variable_ref", initialVariable.get("reference"));
+        expectFault("edit", withIdentity(Map.of("target", staleVariableTarget,
+                "change", Map.of("kind", "rename", "value", "must_not_apply"))), "STALE_REFERENCE");
+        Map<String,Object> afterStaleCalls = inspect(functionAddress);
+        if (!"mcp_probe_state".equals(global(afterStaleCalls, "mcp_probe_state").get("name"))) {
+            throw new IllegalStateException("stale edit changed the global");
+        }
         revert(rename.get("edit_id").toString());
 
         Map<String,Object> afterRename = inspect(functionAddress);
@@ -100,7 +120,37 @@ public class RuntimeMcpToolsProbe extends GhidraScript {
         }
         Map<String,Object> finalSearch = call("searchPseudocode", withIdentity(Map.of(
                 "query", "probe_state", "match_in", "pseudocode")));
-        println("MCP_TOOL_PROBE final_pseudocode=" + finalInspection.get("pseudocode"));
+        Map<String,Object> obsoleteRename = editGlobal(functionAddress, finalGlobal,
+                "rename", "review_probe_state");
+        Map<String,Object> afterObsoleteRename = inspect(functionAddress);
+        Map<String,Object> secondEdit = editGlobal(functionAddress,
+                global(afterObsoleteRename, "review_probe_state"), "comment", "temporary comment");
+        expectFault("revert", withIdentity(Map.of("edit_id", obsoleteRename.get("edit_id"))),
+                "EDIT_NOT_ELIGIBLE");
+        revert(secondEdit.get("edit_id").toString());
+        Map<String,Object> restoreNameInspection = inspect(functionAddress);
+        Map<String,Object> renamedGlobal = global(restoreNameInspection, "review_probe_state");
+        editGlobal(functionAddress, renamedGlobal, "rename", "probe_state");
+        Map<String,Object> completedInspection = inspect(functionAddress);
+        Map<String,Object> completedGlobal = global(completedInspection, "probe_state");
+        if (!"/Probe/ProbeState".equals(completedGlobal.get("data_type_path"))
+                || !"probe global comment".equals(completedGlobal.get("comment"))) {
+            throw new IllegalStateException("probe did not restore its fixture state: " + completedGlobal);
+        }
+
+        Map<String,Object> previousIdentity = new LinkedHashMap<>(identity);
+        call("programSession", withIdentity(Map.of("action", "close")));
+        Map<String,Object> reopened = call("programSession", Map.of("contract_version", 1,
+                "action", "open", "program", "/readability-fixture.elf"));
+        if (previousIdentity.get("session_id").equals(reopened.get("session_id"))
+                || ((Number)reopened.get("generation")).longValue()
+                != ((Number)previousIdentity.get("generation")).longValue() + 1) {
+            throw new IllegalStateException("reopen did not issue a fresh session and generation");
+        }
+        Map<String,Object> oldSessionInspect = new LinkedHashMap<>(previousIdentity);
+        oldSessionInspect.put("function_address", functionAddress);
+        expectFault("inspect", oldSessionInspect, "STALE_SESSION");
+        println("MCP_TOOL_PROBE final_pseudocode=" + completedInspection.get("pseudocode"));
         println("MCP_TOOL_PROBE final_search_matches=" + list(finalSearch, "matches").size());
         println("MCP_TOOL_PROBE PASS");
         loader.close();
@@ -148,6 +198,25 @@ public class RuntimeMcpToolsProbe extends GhidraScript {
             Throwable cause = failure.getCause();
             if (cause instanceof Exception exception) throw exception;
             throw failure;
+        }
+    }
+
+    private void expectFault(String method, Map<String,Object> args, String expectedCode) throws Exception {
+        var operation = serviceClass.getDeclaredMethod(method, Map.class);
+        operation.setAccessible(true);
+        try {
+            operation.invoke(sessions, args);
+            throw new IllegalStateException(method + " unexpectedly succeeded; expected " + expectedCode);
+        } catch (InvocationTargetException failure) {
+            Throwable cause = failure.getCause();
+            Field codeField = cause.getClass().getDeclaredField("code");
+            codeField.setAccessible(true);
+            String actualCode = codeField.get(cause).toString();
+            if (!expectedCode.equals(actualCode)) {
+                throw new IllegalStateException(method + " returned " + actualCode
+                        + "; expected " + expectedCode, cause);
+            }
+            println("MCP_TOOL_PROBE rejected=" + method + " code=" + actualCode);
         }
     }
 

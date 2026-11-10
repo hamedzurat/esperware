@@ -7,8 +7,11 @@ Environment: Ghidra 12.2 PUBLIC, Temurin 25.0.5+8, Linux x86-64.
 - Rebuilt `readability-fixture.elf` with a referenced two-field global state and created `/Probe/ProbeState` on that global in a disposable Ghidra project.
 - Ran `RuntimeMcpToolsProbe.java` against the current extension JAR and a real headless Ghidra program. Pseudocode search found the function using `probe_state`; type search returned both struct fields at offsets 0 and 4; inspection returned the global reference and `/Probe/ProbeState` path.
 - Renamed the global, verified the name in the refreshed inspection/pseudocode, and reverted it. Changed its type from the 8-byte struct to `uint`, then reverted it. Changed and reverted its comment. All edits committed and decompilation completed; the final inspection restored the original name, struct type, and comment.
+- Rejected an edit with an old global reference (`STALE_REFERENCE`), an old revision (`STALE_REVISION`), and an old local-variable reference (`STALE_REFERENCE`); inspection confirmed rejected calls did not mutate the program.
+- Reverted the latest rename successfully. Confirmed that a later edit makes an older rename ineligible (`EDIT_NOT_ELIGIBLE`), then reverted the later edit and restored the original global name.
+- Closed and reopened the service session; the new session/generation was issued and an operation using the prior session failed with `STALE_SESSION`.
 - The type-revert probe exposed a bug: the revert compared the original struct size to the scalar's smaller current size. The implementation now records the original data extent and uses it when restoring the type. The probe passes with this fix.
-- This probe invokes the Ghidra service handlers directly. It does not verify MCP JSON-RPC tool discovery/calls over stdio; that transport probe remains open.
+- This probe invokes Ghidra service handlers directly. It does not verify MCP JSON-RPC tool discovery/calls over stdio, so it is not evidence for the public MCP contract.
 
 ## Completed
 
@@ -92,9 +95,22 @@ The MCP session did not save this program.
 
 ## Still required
 
-The following have not yet been verified through MCP calls: paging, stale
-revision/reference rejection, revert eligibility, GUI concurrency, forced
-decompile timeout recovery, project portability, and internal hypothesis
-events through the Ghidra service.
+The following acceptance criteria remain unverified against the public MCP or
+real Ghidra runtime: MCP stdio discovery/calls for the current tool set;
+paging/cursors and truncation caps; save success without revision advance,
+save failure/retry and preservation of revert eligibility; GUI concurrency
+and GUI edit invalidation; forced decompile-timeout recovery after a committed
+edit; project portability; and internal hypothesis events through the Ghidra
+service across resets/restarts. The direct handler probe covers stale
+revision/reference rejection, rename/type/comment revert, invalidated revert
+eligibility, and stale session rejection, but it does not close these external
+acceptance gaps.
+
+The public API currently includes the two user-requested additional tools
+`search_pseudocode` and `search_types`, beyond issue #10's exact-five-tool
+contract. They are intentionally retained per user direction. This scope
+choice means the implementation does not satisfy that one acceptance item as
+written, although the additional tools are implemented and the handler probe
+exercises them.
 
 Do not treat Ghidra 12.2 as fully contract-accepted until those probes pass.
