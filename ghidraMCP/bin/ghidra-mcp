@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+root_dir="$(cd "$script_dir/.." && pwd)"
+
+if [[ -z "${JAVA_HOME:-}" && -x "$root_dir/.local/jdk25/bin/java" ]]; then
+  export JAVA_HOME="$root_dir/.local/jdk25"
+fi
+
+if [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]]; then
+  JAVA_CMD="$JAVA_HOME/bin/java"
+elif command -v java >/dev/null 2>&1; then
+  JAVA_CMD="$(command -v java)"
+else
+  echo "java not found; set JAVA_HOME to JDK 25+" >&2
+  exit 2
+fi
+
+GHIDRA_DIR="${GHIDRA_INSTALL_DIR:-$root_dir/.local/ghidra_12.2_PUBLIC}"
+if [[ ! -d "$GHIDRA_DIR/Ghidra" ]]; then
+  echo "GHIDRA_INSTALL_DIR invalid or missing: $GHIDRA_DIR" >&2
+  exit 2
+fi
+
+SERVER_DIR="${GHIDRA_MCP_HOME:-$root_dir/build/server}"
+BOOTSTRAP_JAR="$SERVER_DIR/bootstrap.jar"
+LIB_DIR="${GHIDRA_MCP_LIB_DIR:-$SERVER_DIR/lib}"
+if [[ ! -f "$BOOTSTRAP_JAR" || ! -d "$LIB_DIR" ]]; then
+  echo "Server artifacts missing under $SERVER_DIR; run ./gradlew stageServer first" >&2
+  exit 2
+fi
+
+export GHIDRA_INSTALL_DIR="$GHIDRA_DIR"
+export GHIDRA_MCP_WEBUI_DIR="${GHIDRA_MCP_WEBUI_DIR:-$root_dir/../wui}"
+
+exec "$JAVA_CMD" \
+  -Djava.system.class.loader=ghidra.GhidraClassLoader \
+  -Djava.awt.headless=true \
+  -Dfile.encoding=UTF8 -Duser.country=US -Duser.language=en \
+  -Xshare:off \
+  -XX:+UseCompactObjectHeaders \
+  -XX:ParallelGCThreads=2 -XX:CICompilerCount=2 \
+  -Xmx"${GHIDRA_HEADLESS_MAXMEM:-2G}" \
+  --enable-native-access=ALL-UNNAMED \
+  --sun-misc-unsafe-memory-access=allow \
+  -Dorg.slf4j.simpleLogger.logFile=System.err \
+  -Dorg.slf4j.simpleLogger.defaultLogLevel=warn \
+  -Dlog4j.configurationFile="$script_dir/log4j-headless.xml" \
+  -cp "$BOOTSTRAP_JAR:$GHIDRA_DIR/Ghidra/Framework/Utility/lib/Utility.jar" \
+  org.esperware.ghidramcp.Bootstrap --lib-dir "$LIB_DIR" "$@"

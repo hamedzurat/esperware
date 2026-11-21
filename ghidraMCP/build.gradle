@@ -3,11 +3,18 @@ plugins {
 }
 
 group = 'org.esperware.ghidramcp'
-version = '0.1.0'
+version = '0.2.0'
 
 def ghidraInstallDir = providers.gradleProperty('GHIDRA_INSTALL_DIR')
         .orElse(providers.environmentVariable('GHIDRA_INSTALL_DIR'))
         .orNull
+
+if (!ghidraInstallDir) {
+    def localGhidra = file('.local/ghidra_12.2_PUBLIC')
+    if (localGhidra.isDirectory()) {
+        ghidraInstallDir = localGhidra.absolutePath
+    }
+}
 
 if (!ghidraInstallDir) {
     throw new GradleException('Set GHIDRA_INSTALL_DIR to a Ghidra 12.2 installation directory.')
@@ -30,12 +37,16 @@ repositories {
 dependencies {
     compileOnly fileTree(dir: new File(ghidraHome, 'Ghidra'), includes: ['**/*.jar'])
     implementation 'io.modelcontextprotocol.sdk:mcp:2.1.0'
+    implementation 'org.eclipse.jetty:jetty-server:12.0.18'
+    implementation 'org.eclipse.jetty.ee10:jetty-ee10-servlet:12.0.18'
     implementation 'com.google.code.gson:gson:2.13.2'
     implementation 'org.xerial:sqlite-jdbc:3.50.3.0'
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.17'
 
     testImplementation platform('org.junit:junit-bom:5.13.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testRuntimeOnly fileTree(dir: new File(ghidraHome, 'Ghidra'), includes: ['**/*.jar'])
 }
 
 tasks.withType(JavaCompile).configureEach {
@@ -44,18 +55,44 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 test {
-    useJUnitPlatform()
+    useJUnitPlatform {
+        excludeTags 'e2e'
+    }
 }
 
-tasks.register('extensionZip', Zip) {
-    dependsOn tasks.jar
-    archiveBaseName = 'ghidraMCP'
-    archiveVersion = project.version
-    destinationDirectory = layout.buildDirectory.dir('distributions')
+tasks.register('e2eTest', Test) {
+    description = 'Runs end-to-end headless Ghidra MCP tests (default mode=docker).'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'e2e'
+    }
+    dependsOn 'stageServer'
+    systemProperty 'e2e.mode', System.getProperty('e2e.mode', 'docker')
+    systemProperty 'e2e.engine', System.getProperty('e2e.engine', 'podman')
+    systemProperty 'e2e.image', System.getProperty('e2e.image', 'ghidra-mcp:local')
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        showStandardStreams = true
+    }
+}
 
-    from(tasks.jar) { into 'lib' }
-    from(configurations.runtimeClasspath) { into 'lib' }
-    from('Module.manifest')
-    from('extension.properties')
-    from('../LICENSE') { into 'license'; rename { 'LICENSE' } }
+tasks.named('jar', Jar) {
+    exclude 'org/esperware/ghidramcp/Bootstrap*'
+}
+
+tasks.register('bootstrapJar', Jar) {
+    archiveFileName = 'bootstrap.jar'
+    destinationDirectory = layout.buildDirectory.dir('server')
+    from(sourceSets.main.output) {
+        include 'org/esperware/ghidramcp/Bootstrap*'
+    }
+}
+
+tasks.register('stageServer', Sync) {
+    dependsOn tasks.jar, tasks.bootstrapJar
+    into layout.buildDirectory.dir('server/lib')
+    from(tasks.jar)
+    from(configurations.runtimeClasspath)
 }

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ghidraMCP — Version Viewer</title>
+<style>
+  :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #111317; color: #d8dee9; display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 8px 12px; border-bottom: 1px solid #2a2f3a; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; background: #171a21; }
+  .badge { padding: 2px 6px; border-radius: 4px; background: #262b36; color: #88c0d0; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: #bf616a; }
+  .dot.ok { background: #a3be8c; }
+  .main { display: grid; grid-template-columns: 280px 1fr; flex: 1; min-height: 0; }
+  aside { border-right: 1px solid #2a2f3a; overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  section { overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .vitem { padding: 7px 8px; border: 1px solid #252a34; border-radius: 4px; cursor: pointer; background: #161920; }
+  .vitem.active { border-color: #88c0d0; background: #1d2430; }
+  .muted { color: #8b94a5; font-size: 11px; }
+  .tabs { display: flex; gap: 8px; align-items: center; border-bottom: 1px solid #2a2f3a; padding-bottom: 8px; }
+  button, input, select { background: #1b1f27; color: #d8dee9; border: 1px solid #323846; border-radius: 4px; padding: 4px 8px; font: inherit; }
+  button { cursor: pointer; }
+  button.active { border-color: #88c0d0; color: #88c0d0; }
+  pre { margin: 0; padding: 10px; background: #0c0e12; border: 1px solid #252a34; border-radius: 4px; overflow: auto; line-height: 1.45; }
+  .diff-add { color: #a3be8c; }
+  .diff-del { color: #bf616a; }
+  .diff-hunk { color: #88c0d0; }
+  .fn-row { padding: 4px 6px; border-bottom: 1px solid #20242d; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+  .fn-row:hover { background: #1c2029; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="sseDot" title="SSE status"></span>
+  <strong id="binName">loading...</strong>
+  <span class="badge" id="verBadge">v-</span>
+  <span class="muted" id="metaInfo"></span>
+  <span class="muted" id="mcpUrls"></span>
+  <label class="muted" style="margin-left:auto">API:
+    <input id="apiInput" size="22" placeholder="same-origin">
+    <button onclick="setApiBase()">Go</button>
+  </label>
+</header>
+<div class="main">
+  <aside>
+    <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
+      <span class="muted">Diff</span>
+      <input id="fromVer" type="number" min="0" value="0" style="width:54px">
+      <span class="muted">→</span>
+      <input id="toVer" type="number" min="0" value="0" style="width:54px">
+      <button onclick="loadRangeDiff()">Diff</button>
+    </div>
+    <div id="versionList"></div>
+  </aside>
+  <section>
+    <div class="tabs">
+      <button id="tabDiffBtn" class="active" onclick="showTab('diff')">Diff / Step</button>
+      <button id="tabFnBtn" onclick="showTab('fns')">Functions</button>
+      <span class="muted" id="viewTitle"></span>
+    </div>
+    <div id="diffView"></div>
+    <div id="fnView" style="display:none;gap:10px;flex-direction:column">
+      <input id="fnFilter" placeholder="Filter functions..." oninput="loadFunctions()">
+      <div id="fnList" style="max-height:220px;overflow:auto;border:1px solid #252a34;border-radius:4px"></div>
+      <pre id="fnCode">Select a function...</pre>
+    </div>
+  </section>
+</div>
+<script>
+let apiBase = new URLSearchParams(location.search).get('api') || '';
+document.getElementById('apiInput').value = apiBase;
+let activeTab = 'diff', selectedVer = null, sse = null;
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const api = p => (apiBase.replace(/\/+$/, '')) + p;
+
+function setApiBase() { apiBase = document.getElementById('apiInput').value.trim(); boot(); }
+function showTab(t) {
+  activeTab = t;
+  document.getElementById('diffView').style.display = t === 'diff' ? 'block' : 'none';
+  document.getElementById('fnView').style.display = t === 'fns' ? 'flex' : 'none';
+  document.getElementById('tabDiffBtn').classList.toggle('active', t === 'diff');
+  document.getElementById('tabFnBtn').classList.toggle('active', t === 'fns');
+  if (t === 'fns') loadFunctions();
+}
+
+function renderDiffText(txt) {
+  if (!txt) return '<div class="muted">(no pseudocode changes)</div>';
+  return '<pre>' + txt.split('\n').map(line => {
+    const cls = line.startsWith('+') && !line.startsWith('+++') ? 'diff-add'
+      : line.startsWith('-') && !line.startsWith('---') ? 'diff-del'
+      : line.startsWith('@@') ? 'diff-hunk' : '';
+    return cls ? `<span class="${cls}">${esc(line)}</span>` : esc(line);
+  }).join('\n') + '</pre>';
+}
+
+async function loadStatus() {
+  const st = await (await fetch(api('/api/v1/status'))).json();
+  document.getElementById('binName').textContent = st.binary_name || 'unknown';
+  document.getElementById('verBadge').textContent = 'v' + st.version;
+  document.getElementById('metaInfo').textContent = `${st.language || ''} | sha256:${(st.binary_sha256||'').slice(0,12)} | ${st.function_count||0} fns`;
+  document.getElementById('mcpUrls').textContent = `RW:${st.mcp_rw_url} RO:${st.mcp_ro_url}`;
+  document.getElementById('toVer').value = st.version;
+}
+
+async function loadVersions() {
+  const data = await (await fetch(api('/api/v1/versions'))).json();
+  const list = document.getElementById('versionList');
+  list.innerHTML = data.versions.slice().reverse().map(v => `
+    <div class="vitem ${selectedVer === v.version ? 'active' : ''}" data-v="${v.version}" onclick="selectVersion(${v.version})">
+      <div><strong>v${v.version}</strong> · ${esc(v.operation)} ${v.checkpoint_label ? `<span class="badge">${esc(v.checkpoint_label)}</span>` : ''}</div>
+      <div class="muted">${esc(v.reason || '-')} (${v.ops_count} ops, ${esc(v.actor)})</div>
+    </div>`).join('');
+  if (selectedVer === null && data.versions.length) selectVersion(data.current_version);
+}
+
+async function selectVersion(v) {
+  selectedVer = v;
+  showTab('diff');
+  const data = await (await fetch(api('/api/v1/versions/' + v))).json();
+  const ver = data.version;
+  document.getElementById('viewTitle').textContent = `Step v${ver.version} (${ver.operation})`;
+  document.getElementById('diffView').innerHTML = `
+    <div class="muted">Actor: ${esc(ver.actor)} | Time: ${esc(ver.created_at)} | Reason: ${esc(ver.reason || '-')}</div>
+    <details open style="margin:8px 0"><summary class="muted">Ops (${ver.ops.length})</summary><pre>${esc(JSON.stringify(ver.ops, null, 2))}</pre></details>
+    ${(ver.diffs || []).map(d => `<h4>${esc(d.function_name)} (${esc(d.function_address)}) — ${esc(d.decompile_status)}</h4>${renderDiffText(d.diff)}`).join('')}`;
+  document.querySelectorAll('.vitem').forEach(el => el.classList.toggle('active', el.dataset.v === String(v)));
+}
+
+async function loadRangeDiff() {
+  showTab('diff');
+  const f = document.getElementById('fromVer').value, t = document.getElementById('toVer').value;
+  const data = await (await fetch(api(`/api/v1/diff?from=${f}&to=${t}`))).json();
+  document.getElementById('viewTitle').textContent = `Cumulative Diff v${f} → v${t}`;
+  document.getElementById('diffView').innerHTML = (data.diffs || []).length
+    ? data.diffs.map(d => `<h4>${esc(d.function_name)} (${esc(d.function_address)})</h4>${renderDiffText(d.diff)}`).join('')
+    : '<div class="muted">No differences in this range.</div>';
+}
+
+async function loadFunctions() {
+  const q = encodeURIComponent(document.getElementById('fnFilter').value.trim());
+  const data = await (await fetch(api(`/api/v1/functions?limit=100${q ? '&filter=' + q : ''}`))).json();
+  document.getElementById('fnList').innerHTML = (data.functions || []).map(f =>
+    `<div class="fn-row" onclick="loadFn('${esc(f.address)}')"><span>${esc(f.name)}</span><span class="muted">${esc(f.address)} (${f.size}B)</span></div>`
+  ).join('');
+}
+
+async function loadFn(addr) {
+  const data = await (await fetch(api('/api/v1/functions/' + encodeURIComponent(addr)))).json();
+  document.getElementById('viewTitle').textContent = `${data.function.name} @ ${data.function.address} (v${data.version})`;
+  document.getElementById('fnCode').textContent = data.pseudocode || data.decompile_error || '(empty)';
+}
+
+function connectSse() {
+  if (sse) sse.close();
+  sse = new EventSource(api('/api/v1/events'));
+  const dot = document.getElementById('sseDot');
+  sse.onopen = () => dot.classList.add('ok');
+  sse.onerror = () => dot.classList.remove('ok');
+  ['version_created', 'checkpoint_saved'].forEach(ev => sse.addEventListener(ev, () => { loadStatus(); loadVersions(); }));
+}
+
+async function boot() { await loadStatus(); await loadVersions(); connectSse(); }
+boot();
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration>
+  <Appenders>
+    <Console name="stderr" target="SYSTEM_ERR">
+      <PatternLayout pattern="%-5p %m (%c{1}) %ex%n"/>
+    </Console>
+    <Console name="detail" target="SYSTEM_ERR">
+      <PatternLayout pattern="%-5p %m (%c{1}) %ex%n"/>
+    </Console>
+    <Console name="script" target="SYSTEM_ERR">
+      <PatternLayout pattern="%-5p %m (%c{1}) %ex%n"/>
+    </Console>
+  </Appenders>
+  <Loggers>
+    <Root level="WARN">
+      <AppenderRef ref="stderr"/>
+    </Root>
+  </Loggers>
+</Configuration>

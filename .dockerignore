@@ -1,0 +1,9 @@
+.git
+.agents
+.claude
+ghidraMCP/.local
+ghidraMCP/.gradle
+ghidraMCP/build
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
