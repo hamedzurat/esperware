@@ -89,14 +89,19 @@ Read-only tools on `/mcp/ro` and `/mcp/rw`: `program_info`, `list_functions`, `l
 
 Write tools on `/mcp/rw` only: `apply_edits`, `define_type`, `revert`, and `save_checkpoint`.
 
-## Run tests
+## Build and test shortcuts (`ghidraMCP/justfile`)
 
-All tests use Java and JUnit 5:
+Run `just` commands from `ghidraMCP/`:
 
 ```sh
 cd ghidraMCP
-./gradlew test                        # Unit tests (VersionStore and access control)
-./gradlew e2eTest                     # Full container E2E test using Podman
-./gradlew e2eTest -De2e.engine=docker # Container E2E test using Docker
-./gradlew e2eTest -De2e.mode=local    # Local headless binary E2E test
+just --list     # Show available recipes
+just build      # Stage server jars locally
+just test       # Fast JUnit unit tests
+just image      # Build ghidra-mcp:local container image
+just e2e        # Run container E2E suite (Podman by default)
+just e2e-local  # Run local headless E2E suite
+just check      # Run unit tests and container E2E suite
 ```
+
+All tests use Java and JUnit 5. Pass `CONTAINER_ENGINE=docker` to run `image`, `e2e`, or `check` with Docker instead of Podman.

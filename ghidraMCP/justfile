@@ -1,0 +1,36 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+engine := env_var_or_default("CONTAINER_ENGINE", "podman")
+image := env_var_or_default("MCP_IMAGE", "ghidra-mcp:local")
+with_jdk := 'if [ -x "$PWD/.local/jdk25/bin/java" ]; then export JAVA_HOME="$PWD/.local/jdk25" PATH="$PWD/.local/jdk25/bin:$PATH"; fi;'
+
+default:
+    @just --list
+
+# Compile and stage server jars into build/server/
+build:
+    {{with_jdk}} ./gradlew stageServer
+
+# Run fast JUnit unit tests
+test:
+    {{with_jdk}} ./gradlew test
+
+# Build container image from repository root
+image:
+    {{engine}} build -t {{image}} -f Dockerfile ..
+
+# Run container E2E test suite
+e2e:
+    {{with_jdk}} ./gradlew e2eTest -De2e.engine={{engine}} -De2e.image={{image}}
+
+# Run local headless binary E2E test suite
+e2e-local:
+    {{with_jdk}} ./gradlew e2eTest -De2e.mode=local
+
+# Run unit tests and container E2E suite
+check:
+    {{with_jdk}} ./gradlew test e2eTest -De2e.engine={{engine}} -De2e.image={{image}}
+
+# Clean Gradle build outputs
+clean:
+    {{with_jdk}} ./gradlew clean
