@@ -62,7 +62,7 @@ class HeadlessServerE2ETest {
                 .inheritIO()
                 .start();
         assertEquals(0, build.waitFor(), "just build in artifacts/ failed");
-        fixturePath = artifactsDir.resolve("build/readability-fixture.elf");
+        fixturePath = artifactsDir.resolve("build/readability-fixture.stripped.elf");
 
         String sysTmp = System.getProperty("java.io.tmpdir", "/tmp");
         boolean hasDot = false;

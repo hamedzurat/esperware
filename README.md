@@ -4,52 +4,54 @@ Headless Ghidra 12.2 MCP server with versioned edits, read-only subagent endpoin
 
 ## Repository layout
 
+- `justfile`: shortcut commands to start, inspect, and stop a binary container.
 - `ghidraMCP/`: headless Java Ghidra server, container build, and JUnit 5 test suite. See [the architecture notes](ghidraMCP/README.md) for internals.
 - `wui/`: standalone browser page that connects to a running server port to inspect versions, unified diffs, and functions.
-- `artifacts/`: C test sources and a `justfile` that builds stripped ELF binaries into `artifacts/build/`.
+- `artifacts/`: C test sources and a `justfile` that builds `-O1` stripped and unstripped ELF binaries into `artifacts/build/`.
 
 ## Build test binaries
 
-Run `just` inside `artifacts/` to compile every `.c` file into a stripped ELF under `artifacts/build/`:
+Run `just` inside `artifacts/` to compile every `.c` file at `-O1` (`-fno-inline`) into both `build/<name>.unstripped.elf` (with DWARF) and `build/<name>.stripped.elf`:
 
 ```sh
-cd artifacts
-just
+just artifacts
 ```
 
-Run `just one readability-fixture` to build one file, or `just clean` to remove `artifacts/build/`.
+Or run `cd artifacts && just one <name>` for one C file, or `cd artifacts && just clean` to remove `artifacts/build/`.
 
-## Run the MCP server in a container
+## Quickstart with containers
 
-One container runs one binary at a time. Build the image from the repository root:
+Build the container image once:
 
 ```sh
-podman build -t ghidra-mcp:local -f ghidraMCP/Dockerfile .
+just image
 ```
 
-Start a container and mount a host directory at `/data` for your binary, work directory, and SHA-256 analysis cache:
+Start the server by pointing at a binary, port (default `8765`), and state directory (default `/tmp/esperware-<port>`):
 
 ```sh
-podman run --rm -d \
-	-p 127.0.0.1:8765:8765 \
-	-v /path/to/data:/data \
-	ghidra-mcp:local \
-	--binary /data/target.elf \
-	--work-dir /data/run-01 \
-	--cache-dir /data/cache
+just run ./artifacts/build/readability-fixture.stripped.elf 8765 /tmp/my-run
 ```
 
-Check `/path/to/data/run-01/ready.json` or `GET http://127.0.0.1:8765/api/v1/status` to confirm readiness. The server prints one JSON line to standard output when ready and exposes these routes:
+`just run` creates `/tmp/my-run/run` (project and SQLite history) and `/tmp/my-run/cache` (SHA-256 baseline cache), starts the container, waits until ready, and prints the endpoints:
 
 - Main agent (read-write, 13 tools): `http://127.0.0.1:8765/mcp/rw`
 - Subagents (read-only, 9 tools): `http://127.0.0.1:8765/mcp/ro`
 - REST and SSE API: `http://127.0.0.1:8765/api/v1`
 
-Restarting the container with the same `--work-dir` and omitting `--binary` resumes from the existing Ghidra project and SQLite version history. Send `SIGTERM` or `POST http://127.0.0.1:8765/api/v1/shutdown` to stop the server cleanly.
+Open [the WebUI page](wui/index.html) directly (or run `just wui 8765`) to view versions, unified diffs, and functions.
 
-## Open the WebUI
+Manage running containers with:
 
-Open [the WebUI page](wui/index.html) directly in a browser, enter the Ghidra server port (default `8765`) or full base URL in **Port / URL**, and select **Connect**. You can also pass `?port=8765` in the URL query string.
+```sh
+just status 8765              # Query live binary metadata and current version
+just ps                       # List running ghidra-mcp containers
+just logs 8765                # View container logs
+just stop 8765                # Graceful shutdown
+just resume /tmp/my-run 8765  # Reopen existing project and version history
+```
+
+Pass `CONTAINER_ENGINE=docker` before any `just` command to use Docker instead of Podman.
 
 ## Run locally without a container
 
@@ -57,9 +59,9 @@ Requires JDK 25 and Ghidra 12.2 (`GHIDRA_INSTALL_DIR` or `ghidraMCP/.local/ghidr
 
 ```sh
 cd ghidraMCP
-./gradlew stageServer
+just build
 ./bin/ghidra-mcp \
-	--binary ../artifacts/build/readability-fixture.elf \
+	--binary ../artifacts/build/readability-fixture.stripped.elf \
 	--work-dir /tmp/run-01 \
 	--cache-dir /tmp/ghidra-cache \
 	--port 0
@@ -89,19 +91,15 @@ Read-only tools on `/mcp/ro` and `/mcp/rw`: `program_info`, `list_functions`, `l
 
 Write tools on `/mcp/rw` only: `apply_edits`, `define_type`, `revert`, and `save_checkpoint`.
 
-## Build and test shortcuts (`ghidraMCP/justfile`)
+## Build and test commands
 
-Run `just` commands from `ghidraMCP/`:
+All tests use Java and JUnit 5:
 
 ```sh
-cd ghidraMCP
-just --list     # Show available recipes
-just build      # Stage server jars locally
-just test       # Fast JUnit unit tests
-just image      # Build ghidra-mcp:local container image
-just e2e        # Run container E2E suite (Podman by default)
-just e2e-local  # Run local headless E2E suite
-just check      # Run unit tests and container E2E suite
+just --list     # List top-level run and test commands
+just test       # Fast unit tests (VersionStore and access control)
+just e2e        # Container E2E suite using Podman
+just check      # Unit tests and container E2E suite
 ```
 
-All tests use Java and JUnit 5. Pass `CONTAINER_ENGINE=docker` to run `image`, `e2e`, or `check` with Docker instead of Podman.
+Inside `ghidraMCP/`, `just e2e-local` runs the same E2E suite against the local headless launcher without containers.
