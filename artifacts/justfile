@@ -1,0 +1,22 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+default: build
+
+build:
+    mkdir -p build
+    for src in *.c; do \
+        [ -e "$src" ] || continue; \
+        stem="${src%.c}"; \
+        gcc -O0 -fno-inline -fno-stack-protector -no-pie -g0 "$src" -o "build/${stem}.elf"; \
+        strip --strip-all "build/${stem}.elf"; \
+        echo "built build/${stem}.elf"; \
+    done
+
+one name:
+    mkdir -p build
+    gcc -O0 -fno-inline -fno-stack-protector -no-pie -g0 "{{name}}.c" -o "build/{{name}}.elf"
+    strip --strip-all "build/{{name}}.elf"
+    echo "built build/{{name}}.elf"
+
+clean:
+    if [ -e build ]; then /usr/bin/trash-put -- build; fi

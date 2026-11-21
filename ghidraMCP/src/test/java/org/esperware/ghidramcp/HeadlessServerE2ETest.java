@@ -56,12 +56,13 @@ class HeadlessServerE2ETest {
     @BeforeAll
     static void setupFixture() throws Exception {
         repoDir = Path.of("").toAbsolutePath().normalize();
-        Process build = new ProcessBuilder(repoDir.resolve("fixtures/build-fixture.sh").toString())
-                .directory(repoDir.toFile())
+        Path artifactsDir = repoDir.getParent().resolve("artifacts");
+        Process build = new ProcessBuilder("just", "build")
+                .directory(artifactsDir.toFile())
                 .inheritIO()
                 .start();
-        assertEquals(0, build.waitFor(), "build-fixture.sh failed");
-        fixturePath = repoDir.resolve("build/fixtures/readability-fixture.elf");
+        assertEquals(0, build.waitFor(), "just build in artifacts/ failed");
+        fixturePath = artifactsDir.resolve("build/readability-fixture.elf");
 
         String sysTmp = System.getProperty("java.io.tmpdir", "/tmp");
         boolean hasDot = false;
@@ -207,10 +208,13 @@ class HeadlessServerE2ETest {
         JsonObject chk = rw.callOk("save_checkpoint", Map.of("label", "after-transform"));
         assertEquals(2L, chk.get("version").getAsLong());
 
-        // 3. WebUI HTML + REST + SSE checks
-        HttpResponse<String> htmlResp = get(baseUrl + "/");
-        assertEquals(200, htmlResp.statusCode());
-        assertTrue(htmlResp.body().contains("ghidraMCP — Version Viewer"));
+        // 3. REST + CORS (for external wui/) + SSE checks
+        HttpResponse<String> rootResp = get(baseUrl + "/");
+        assertEquals(404, rootResp.statusCode());
+
+        HttpResponse<String> statusResp = get(apiUrl + "/status");
+        assertEquals(200, statusResp.statusCode());
+        assertEquals("*", statusResp.headers().firstValue("Access-Control-Allow-Origin").orElse(""));
 
         JsonObject versions = getJson(apiUrl + "/versions");
         assertEquals(2L, versions.get("current_version").getAsLong());

@@ -18,7 +18,7 @@
   .vitem.active { border-color: #88c0d0; background: #1d2430; }
   .muted { color: #8b94a5; font-size: 11px; }
   .tabs { display: flex; gap: 8px; align-items: center; border-bottom: 1px solid #2a2f3a; padding-bottom: 8px; }
-  button, input, select { background: #1b1f27; color: #d8dee9; border: 1px solid #323846; border-radius: 4px; padding: 4px 8px; font: inherit; }
+  button, input { background: #1b1f27; color: #d8dee9; border: 1px solid #323846; border-radius: 4px; padding: 4px 8px; font: inherit; }
   button { cursor: pointer; }
   button.active { border-color: #88c0d0; color: #88c0d0; }
   pre { margin: 0; padding: 10px; background: #0c0e12; border: 1px solid #252a34; border-radius: 4px; overflow: auto; line-height: 1.45; }
@@ -32,13 +32,13 @@
 <body>
 <header>
   <span class="dot" id="sseDot" title="SSE status"></span>
-  <strong id="binName">loading...</strong>
+  <strong id="binName">disconnected</strong>
   <span class="badge" id="verBadge">v-</span>
   <span class="muted" id="metaInfo"></span>
   <span class="muted" id="mcpUrls"></span>
-  <label class="muted" style="margin-left:auto">API:
-    <input id="apiInput" size="22" placeholder="same-origin">
-    <button onclick="setApiBase()">Go</button>
+  <label class="muted" style="margin-left:auto">Port / URL:
+    <input id="targetInput" size="22" placeholder="8765 or http://127.0.0.1:8765">
+    <button onclick="connectTarget()">Connect</button>
   </label>
 </header>
 <div class="main">
@@ -67,16 +67,35 @@
   </section>
 </div>
 <script>
-let apiBase = new URLSearchParams(location.search).get('api') || '';
-document.getElementById('apiInput').value = apiBase;
-let activeTab = 'diff', selectedVer = null, sse = null;
+const STORAGE_KEY = 'ghidramcp.target';
+let selectedVer = null, sse = null;
+
+function normalizeTarget(raw) {
+  const s = (raw || '').trim();
+  if (!s) return 'http://127.0.0.1:8765';
+  if (/^\d+$/.test(s)) return `http://127.0.0.1:${s}`;
+  return s.replace(/\/+$/, '');
+}
+
+const params = new URLSearchParams(location.search);
+const initialRaw = params.get('port') || params.get('api') || localStorage.getItem(STORAGE_KEY) || '8765';
+let apiBase = normalizeTarget(initialRaw);
+const targetInput = document.getElementById('targetInput');
+targetInput.value = initialRaw;
+targetInput.addEventListener('keydown', e => { if (e.key === 'Enter') connectTarget(); });
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const api = p => (apiBase.replace(/\/+$/, '')) + p;
+const api = p => apiBase + p;
 
-function setApiBase() { apiBase = document.getElementById('apiInput').value.trim(); boot(); }
+function connectTarget() {
+  const raw = targetInput.value.trim() || '8765';
+  localStorage.setItem(STORAGE_KEY, raw);
+  apiBase = normalizeTarget(raw);
+  selectedVer = null;
+  boot();
+}
+
 function showTab(t) {
-  activeTab = t;
   document.getElementById('diffView').style.display = t === 'diff' ? 'block' : 'none';
   document.getElementById('fnView').style.display = t === 'fns' ? 'flex' : 'none';
   document.getElementById('tabDiffBtn').classList.toggle('active', t === 'diff');
@@ -160,7 +179,19 @@ function connectSse() {
   ['version_created', 'checkpoint_saved'].forEach(ev => sse.addEventListener(ev, () => { loadStatus(); loadVersions(); }));
 }
 
-async function boot() { await loadStatus(); await loadVersions(); connectSse(); }
+async function boot() {
+  try {
+    await loadStatus();
+    await loadVersions();
+    connectSse();
+  } catch (err) {
+    document.getElementById('sseDot').classList.remove('ok');
+    document.getElementById('binName').textContent = 'unreachable';
+    document.getElementById('verBadge').textContent = 'v-';
+    document.getElementById('metaInfo').textContent = apiBase;
+    document.getElementById('diffView').innerHTML = `<div class="muted">Cannot reach ${esc(apiBase)} (${esc(err.message || err)}). Enter Ghidra port and click Connect.</div>`;
+  }
+}
 boot();
 </script>
 </body>

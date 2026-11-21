@@ -1,75 +1,84 @@
-# ghidraMCP
+# ghidraMCP internals and architecture
 
-Standalone **headless** Ghidra 12.2 MCP server (no Swing GUI, no `Xvfb`). One container/process owns one binary and serves:
+`ghidraMCP` is a standalone headless Java application that embeds Ghidra 12.2, Jetty 12, SQLite, and the MCP Java SDK 2.1.0 inside one JVM. It runs without Swing, AWT windows, or `Xvfb`.
 
-- `/mcp/rw` — Streamable HTTP MCP for the primary read-write agent (**13 tools**: 9 read + 4 write)
-- `/mcp/ro` — Streamable HTTP MCP for read-only subagents (**9 read tools only**; writes hidden and blocked in service layer)
-- `/api/v1/*` — Simple REST + SSE API for version history and diffs
-- `/` — Simple WebUI served from [`../wui/index.html`](../wui/index.html)
+## Component architecture
 
-## Run with Docker / Podman (Recommended)
+```mermaid
+flowchart LR
+	Boot["Bootstrap (AppClassLoader)"] --> Launch["GhidraMcpLauncher (GhidraClassLoader)"]
+	Launch --> Jetty["Embedded Jetty 12 (Virtual / Servlet Threads)"]
+	Launch --> WS["ProgramWorkspace (GhidraProject + DecompInterface Pool)"]
+	Launch --> VS["VersionStore (SQLite WAL + SSE Subscribers)"]
 
-Build the container image from the repository root:
+	Jetty --> RW["/mcp/rw (13 tools, READ_WRITE)"]
+	Jetty --> RO["/mcp/ro (9 tools, READ_ONLY)"]
+	Jetty --> API["WebApiServlet (/api/v1/* + SSE)"]
 
-```sh
-podman build -t ghidra-mcp:local -f ghidraMCP/Dockerfile .
+	RW --> IS["InspectService"]
+	RW --> ES["EditService"]
+	RO --> IS
+	API --> IS
+	API --> VS
+
+	IS --> WS
+	ES --> WS
+	ES --> VS
 ```
 
-Start one server on a target binary and mount a data directory for persistent project state, SQLite version history, and SHA-256 analysis cache:
+| Class | Role |
+|---|---|
+| `Bootstrap` | Minimal entry point loaded on `AppClassLoader` alongside Ghidra `Utility.jar`. |
+| `GhidraMcpLauncher` | Implements `GhidraLaunchable`; parses flags, boots Jetty and Ghidra, writes `ready.json`, and coordinates shutdown. |
+| `ProgramWorkspace` | Owns the single `GhidraProject` and `Program`, SHA-256 project cache, `ReentrantReadWriteLock`, `DecompInterface` pool, and decompile cache. |
+| `InspectService` | Implements the 9 read-only MCP queries and live inspection REST handlers under read lock. |
+| `EditService` | Enforces `AccessMode.READ_WRITE`, checks `expected_version`, runs single-transaction edits, computes diffs, and applies multi-step reverts under write lock. |
+| `VersionStore` | SQLite WAL ledger storing `v0` metadata, ordered mutation versions, inverse operations, function diffs, checkpoints, and SSE event listeners. |
+| `McpEndpoints` | Registers `/mcp/rw` and `/mcp/ro` `HttpServletStreamableServerTransportProvider` instances with `ToolAnnotations` and Host/Origin checks. |
+| `WebApiServlet` | Serves `/api/v1/*` JSON endpoints, async SSE `/api/v1/events`, CORS headers, and `POST /api/v1/shutdown`. |
+| `ApiError` | Typed fault (`code`, `currentVersion`), `AccessMode` enum, request argument validation, cursor codec, and LCS unified diff generator. |
 
-```sh
-podman run --rm -d \
-  -p 127.0.0.1:8765:8765 \
-  -v /path/to/data:/data \
-  ghidra-mcp:local \
-  --binary /data/target.elf \
-  --work-dir /data/run-01 \
-  --cache-dir /data/cache
-```
+## Classloader and headless boot
 
-Check `/path/to/data/run-01/ready.json` (or `GET http://127.0.0.1:8765/api/v1/status`):
+Ghidra 12.2 requires `-Djava.system.class.loader=ghidra.GhidraClassLoader`. Because `GhidraClassLoader` delegates parent-first to `AppClassLoader`, placing server classes on the JVM `-cp` makes them unable to resolve Ghidra module classes loaded later into `GhidraClassLoader`.
 
-- WebUI: `http://127.0.0.1:8765/`
-- Main agent (RW): `http://127.0.0.1:8765/mcp/rw`
-- Subagents (RO): `http://127.0.0.1:8765/mcp/ro`
+`build.gradle` splits the build into two artifacts:
 
-Restarting on `--work-dir /data/run-01` resumes from the existing project and SQLite version history. Stop cleanly with `SIGTERM` or `POST /api/v1/shutdown`.
+1. `bootstrap.jar` contains only `Bootstrap`, which depends solely on JDK classes and `Utility.jar`.
+2. `build/server/lib/*.jar` contains `ghidraMCP-0.2.0.jar`, Jetty, MCP SDK, Jackson, Gson, SLF4J 2, and `sqlite-jdbc`.
 
-## Local Build & Run
+`Bootstrap.main` adds `lib/*.jar` to `GhidraClassLoader` first (so SLF4J 2.0.17 wins over Ghidra's bundled SLF4J 1.7.25), calls `GhidraLauncher.initializeGhidraEnvironment()` to append Ghidra's modules, and reflectively invokes `GhidraMcpLauncher.launch`.
 
-Requires JDK 25 and Ghidra 12.2 (`GHIDRA_INSTALL_DIR`, or `.local/ghidra_12.2_PUBLIC`):
+`GhidraMcpLauncher` initializes Ghidra via `Application.initializeApplication(layout, new HeadlessGhidraApplicationConfiguration())`. `bin/log4j-headless.xml` routes `console`, `detail`, and `script` appenders to `SYSTEM_ERR` at level `WARN`, keeping `stdout` clean for the single ready JSON line.
 
-```sh
-./gradlew stageServer
-./bin/ghidra-mcp --binary /path/to/target.elf --work-dir /tmp/run-01 --cache-dir /tmp/ghidra-cache --port 0
-```
+## Startup, Jetty proxying, and shutdown
 
-Optional flags/env: `--host` (`GHIDRA_MCP_HOST`), `--port` (`GHIDRA_MCP_PORT`, default `8765`), `--public-url` (`GHIDRA_MCP_PUBLIC_URL`), `--no-cache`, `--decompiler-pool <n>`, `--webui-dir` (`GHIDRA_MCP_WEBUI_DIR`), `--cors-origin` (`GHIDRA_MCP_CORS_ORIGIN`), `--rw-token` (`GHIDRA_MCP_RW_TOKEN`), `--ro-token` (`GHIDRA_MCP_RO_TOKEN`).
+Jetty starts before Ghidra opens the binary. Two `ProxyServlet` placeholders on `/mcp/rw` and `/mcp/ro` return HTTP `503` while `WebApiServlet` serves `/api/v1/health` with `status: "analyzing"`. Once `ProgramWorkspace` and `VersionStore` finish initialization, `GhidraMcpLauncher` attaches the real MCP transports, marks the servlet `ready`, writes `ready.json` atomically via `.tmp` rename, and prints the ready JSON line to `stdout`.
 
-## Tests (Pure Java JUnit 5)
+On `SIGTERM` or `POST /api/v1/shutdown`, `GhidraMcpLauncher` deletes `ready.json`, completes active SSE `AsyncContext` connections, stops Jetty (`stopTimeout = 1000ms`), closes the MCP servers, closes SQLite, saves any unsaved `Program` changes before closing `GhidraProject`, and exits with code `0` so Ghidra and Reactor daemon threads do not stall container teardown.
 
-```sh
-./gradlew test                        # Fast unit tests (VersionStore + access control)
-./gradlew e2eTest                     # Full container E2E test (Podman by default)
-./gradlew e2eTest -De2e.engine=docker # Same E2E test with Docker
-./gradlew e2eTest -De2e.mode=local    # Local headless binary E2E test
-```
+## Workspace concurrency, caching, and Ghidra internals
 
-## MCP Tools
+- **Project lifecycle and SHA-256 cache**: `ProgramWorkspace.open` checks `--work-dir/ghidra-project/workspace.gpr` first to resume an existing session. On a cold run, it hashes the input binary; if `<cache-dir>/<sha256>/workspace.gpr` exists, it copies that project (skipping `*.lock*` files) into `--work-dir`. Otherwise it imports the binary, runs `GhidraProject.analyze(program)`, persists via `project.saveAs(program, "/", binaryName, true)`, and populates the cache atomically via a temporary sibling directory.
+- **Locking and decompiler pooling**: Read queries acquire `rwLock.readLock()` and borrow one `DecompInterface` from a bounded `ArrayBlockingQueue` (default size `2`), allowing concurrent read-only subagent calls. Mutations acquire `rwLock.writeLock()`, invalidate `decompileCache` (up to `512` immutable entries), and flush every `DecompInterface` cache.
+- **Decompiler vs database variables**: `Function.getAllVariables()` omits variables synthesized only in decompiler output (`local_*`, `uVar*`, `param_*`). `ProgramWorkspace.extractVariables` merges `HighFunction.getLocalSymbolMap().getSymbols()` with DB variables. `EditService` resolves `HighSymbol` targets and commits renames, types, and variable comments back to the Ghidra database via `HighFunctionDBUtil.updateDBVariable(...)`, tracking intra-batch aliases so a later op in the same `apply_edits` array sees an earlier rename.
+- **Data types and global safety**: `InspectService.getType` searches both `program.getDataTypeManager()` and `BuiltInDataTypeManager.getDataTypeManager()`. `EditService.defineType` parses C declarations inside an isolated `StandAloneDataTypeManager` first so invalid C cannot mutate the program. Global type updates reject variable-size types or sizes exceeding the defined data extent and preserve existing comments.
 
-**Read-only (9 — `/mcp/ro` and `/mcp/rw`):**
-`program_info`, `list_functions`, `list_symbols`, `decompile`, `disassemble`, `get_xrefs`, `read_memory`, `search_code`, `get_type`
+## Version store and rollback
 
-**Write (4 — `/mcp/rw` only):**
-`apply_edits` (atomic batch of renames/types/signatures/comments with `expected_version`), `define_type` (C declaration parser), `revert` (multi-step rollback via stored inverse ops), `save_checkpoint`
+`VersionStore` persists a linear ledger in `--work-dir/history.sqlite` (WAL mode, synchronous `NORMAL`):
 
-## WebUI & REST API
+- `meta`: stores `binary_name`, `binary_sha256`, `ghidra_version`, and `arch`.
+- `versions`: stores sequential `version` (`0` for `initial`), `parent_version`, `created_at`, `actor`, `operation`, `reason`, `checkpoint_label`, `ops_json`, `inverse_ops_json`, and `functions_json`.
+- `function_diffs`: stores per-touched-function `before_c`, `after_c`, `diff_text`, and `decompile_status`.
 
-- `GET /api/v1/health` — `analyzing | ready | error`
-- `GET /api/v1/status` — binary metadata, `version`, MCP URLs
-- `GET /api/v1/versions` — lightweight step timeline (`v0..vN`)
-- `GET /api/v1/versions/{v}` — step ops, before/after pseudocode, unified diffs
-- `GET /api/v1/diff?from=0&to=N[&function=...]` — cumulative diff across stages
-- `GET /api/v1/functions` & `GET /api/v1/functions/{addr}` — live function list and decompiled C
-- `GET /api/v1/events` — SSE stream (`status`, `version_created`, `checkpoint_saved`)
-- `POST /api/v1/shutdown` — graceful shutdown
+Every `apply_edits`, `define_type`, and `revert` call requires `expected_version` matching `store.currentVersion()`, commits one Ghidra transaction, redecompiles touched functions once, computes a line-based LCS unified diff (`ApiError.unifiedDiff`), and appends one SQLite transaction.
+
+Multi-step `revert(to_version, expected_version)` queries `inverse_ops_json` in descending version order across `(to_version, current_version]` and applies them in one Ghidra transaction, recording the rollback itself as a new version so timeline history stays append-only. Note that reverting `define_type` removes newly created types by path (`remove_type`), while overwritten composite definitions require restoring from a saved `.gpr` project checkpoint.
+
+Cross-stage diffs (`GET /api/v1/diff?from=A&to=B`) select each function's earliest `before_c` and latest `after_c` in `(A, B]` and recompute the unified diff.
+
+## Transport and access control
+
+- **Role isolation**: `McpEndpoints` mounts `/mcp/ro` with only the 9 read tool specifications (`readOnlyHint = true`) and `/mcp/rw` with all 13 tools (`apply_edits`, `define_type`, `revert`, `save_checkpoint` marked `readOnlyHint = false`). `EditService` also checks `AccessMode.READ_WRITE` at entry as defense in depth.
+- **HTTP security and CORS**: A custom `ServerTransportSecurityValidator` allows loopback `Host` headers on ephemeral or fixed ports (and any `Host` when bound to `0.0.0.0`). An optional Jakarta `Filter` enforces `Authorization: Bearer <token>` on `/mcp/rw`, `/mcp/ro`, and `POST /api/v1/shutdown` when configured. `WebApiServlet` sets `Access-Control-Allow-Origin` (`*` by default) so external WebUI pages can query REST and SSE endpoints.

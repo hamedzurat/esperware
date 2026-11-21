@@ -22,7 +22,6 @@ COPY --from=build /opt/ghidra /opt/ghidra
 COPY --from=build /build/ghidraMCP/build/server /opt/ghidra-mcp
 COPY ghidraMCP/bin/ghidra-mcp /opt/ghidra-mcp/bin/ghidra-mcp
 COPY ghidraMCP/bin/log4j-headless.xml /opt/ghidra-mcp/bin/log4j-headless.xml
-COPY wui /opt/ghidra-mcp/wui
 
 RUN chmod +x /opt/ghidra-mcp/bin/ghidra-mcp \
     && mkdir -p /root/.config/ghidra/ghidra_12.2_PUBLIC \
@@ -30,7 +29,6 @@ RUN chmod +x /opt/ghidra-mcp/bin/ghidra-mcp \
 
 ENV GHIDRA_INSTALL_DIR=/opt/ghidra \
     GHIDRA_MCP_HOME=/opt/ghidra-mcp \
-    GHIDRA_MCP_WEBUI_DIR=/opt/ghidra-mcp/wui \
     GHIDRA_MCP_HOST=0.0.0.0 \
     GHIDRA_MCP_PORT=8765
 

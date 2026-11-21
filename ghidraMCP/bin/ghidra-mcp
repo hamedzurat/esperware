@@ -32,7 +32,6 @@ if [[ ! -f "$BOOTSTRAP_JAR" || ! -d "$LIB_DIR" ]]; then
 fi
 
 export GHIDRA_INSTALL_DIR="$GHIDRA_DIR"
-export GHIDRA_MCP_WEBUI_DIR="${GHIDRA_MCP_WEBUI_DIR:-$root_dir/../wui}"
 
 exec "$JAVA_CMD" \
   -Djava.system.class.loader=ghidra.GhidraClassLoader \

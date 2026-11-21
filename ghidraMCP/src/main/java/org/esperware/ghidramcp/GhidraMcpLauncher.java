@@ -32,7 +32,7 @@ import org.eclipse.jetty.ee10.servlet.ServletHolder;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
 
-/** Headless Ghidra entry point hosting /mcp/rw, /mcp/ro, /api/v1/*, and the WebUI on one Jetty port. */
+/** Headless Ghidra entry point hosting /mcp/rw, /mcp/ro, and /api/v1/* on one Jetty port. */
 public final class GhidraMcpLauncher implements GhidraLaunchable {
     public GhidraMcpLauncher() {}
 
@@ -45,7 +45,7 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
 
         ProxyServlet rwProxy = new ProxyServlet();
         ProxyServlet roProxy = new ProxyServlet();
-        WebApiServlet webApi = new WebApiServlet(cfg.webuiDir, cfg.corsOrigin);
+        WebApiServlet webApi = new WebApiServlet(cfg.corsOrigin);
 
         Server jetty = new Server();
         ServerConnector connector = new ServerConnector(jetty);
@@ -136,7 +136,6 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             ready.put("mcp_rw_url", baseUrl + "/mcp/rw");
             ready.put("mcp_ro_url", baseUrl + "/mcp/ro");
             ready.put("api_url", baseUrl + "/api/v1");
-            ready.put("webui_url", baseUrl + "/");
 
             String jsonLine = new Gson().toJson(ready);
             writeAtomically(readyFile, jsonLine + "\n");
@@ -223,7 +222,6 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             String host,
             int port,
             String publicUrl,
-            Path webuiDir,
             String corsOrigin,
             int poolSize,
             String rwToken,
@@ -238,7 +236,6 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             String host = System.getenv().getOrDefault("GHIDRA_MCP_HOST", "127.0.0.1");
             int port = Integer.parseInt(System.getenv().getOrDefault("GHIDRA_MCP_PORT", "8765"));
             String publicUrl = System.getenv("GHIDRA_MCP_PUBLIC_URL");
-            Path webuiDir = detectWebUiDir(System.getenv("GHIDRA_MCP_WEBUI_DIR"));
             String corsOrigin = System.getenv("GHIDRA_MCP_CORS_ORIGIN");
             int poolSize = 2;
             String rwToken = System.getenv("GHIDRA_MCP_RW_TOKEN");
@@ -253,7 +250,6 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
                     case "--host" -> host = requireArg(args, ++i, "--host");
                     case "--port" -> port = Integer.parseInt(requireArg(args, ++i, "--port"));
                     case "--public-url" -> publicUrl = requireArg(args, ++i, "--public-url");
-                    case "--webui-dir" -> webuiDir = Path.of(requireArg(args, ++i, "--webui-dir"));
                     case "--cors-origin" -> corsOrigin = requireArg(args, ++i, "--cors-origin");
                     case "--decompiler-pool" -> poolSize = Integer.parseInt(requireArg(args, ++i, "--decompiler-pool"));
                     case "--rw-token" -> rwToken = requireArg(args, ++i, "--rw-token");
@@ -265,21 +261,12 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
                 throw new IllegalArgumentException("--work-dir is required");
             }
             if (noCache) cacheDir = null;
-            return new Config(binary, workDir, cacheDir, host, port, publicUrl, webuiDir, corsOrigin, poolSize, rwToken, roToken);
+            return new Config(binary, workDir, cacheDir, host, port, publicUrl, corsOrigin, poolSize, rwToken, roToken);
         }
 
         private static String requireArg(String[] args, int idx, String flag) {
             if (idx >= args.length) throw new IllegalArgumentException(flag + " requires a value");
             return args[idx];
-        }
-
-        private static Path detectWebUiDir(String env) {
-            if (env != null && !env.isBlank() && Files.isDirectory(Path.of(env))) return Path.of(env);
-            Path sibling = Path.of("../wui");
-            if (Files.isDirectory(sibling)) return sibling;
-            Path local = Path.of("wui");
-            if (Files.isDirectory(local)) return local;
-            return null;
         }
     }
 }

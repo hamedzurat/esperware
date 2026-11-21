@@ -1,6 +1,7 @@
 .git
 .agents
 .claude
+artifacts/build
 ghidraMCP/.local
 ghidraMCP/.gradle
 ghidraMCP/build

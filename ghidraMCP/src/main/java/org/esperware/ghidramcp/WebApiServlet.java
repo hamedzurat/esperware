@@ -9,8 +9,6 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -18,15 +16,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Simple REST + SSE + static WebUI servlet on /api/v1/* and /. */
+/** Simple REST + SSE API on /api/v1/* for external WebUI clients. */
 final class WebApiServlet extends HttpServlet {
-    private static final Map<String, String> MIME = Map.of(
-            ".html", "text/html; charset=utf-8",
-            ".js", "application/javascript; charset=utf-8",
-            ".css", "text/css; charset=utf-8",
-            ".json", "application/json; charset=utf-8",
-            ".svg", "image/svg+xml");
-
     record ReadyContext(
             ProgramWorkspace workspace,
             VersionStore store,
@@ -36,7 +27,6 @@ final class WebApiServlet extends HttpServlet {
             Runnable shutdownTrigger) {}
 
     private final Gson gson = new Gson();
-    private final Path webuiDir;
     private final String corsOrigin;
     private final long startedAtMs = System.currentTimeMillis();
     private final AtomicReference<String> phase = new AtomicReference<>("analyzing");
@@ -44,9 +34,8 @@ final class WebApiServlet extends HttpServlet {
     private final AtomicReference<ReadyContext> ctxRef = new AtomicReference<>();
     private final Set<AsyncContext> activeSse = ConcurrentHashMap.newKeySet();
 
-    WebApiServlet(Path webuiDir, String corsOrigin) {
-        this.webuiDir = webuiDir == null ? null : webuiDir.toAbsolutePath().normalize();
-        this.corsOrigin = corsOrigin;
+    WebApiServlet(String corsOrigin) {
+        this.corsOrigin = (corsOrigin == null || corsOrigin.isBlank()) ? "*" : corsOrigin;
     }
 
     void markReady(ReadyContext ctx) {
@@ -84,7 +73,7 @@ final class WebApiServlet extends HttpServlet {
         }
 
         if (!path.startsWith("/api/")) {
-            serveWebUi(path, resp);
+            sendJson(resp, 404, Map.of("ok", false, "error", "API route not found"));
             return;
         }
 
@@ -210,32 +199,8 @@ final class WebApiServlet extends HttpServlet {
         }
     }
 
-    private void serveWebUi(String reqPath, HttpServletResponse resp) throws IOException {
-        if (webuiDir == null || !Files.isDirectory(webuiDir)) {
-            sendJson(resp, 404, Map.of("ok", false, "error", "WebUI directory not configured"));
-            return;
-        }
-        String rel = "/".equals(reqPath) ? "index.html" : reqPath.replaceFirst("^/+", "");
-        Path resolved = webuiDir.resolve(rel).normalize();
-        if (!resolved.startsWith(webuiDir) || !Files.isRegularFile(resolved)) {
-            sendJson(resp, 404, Map.of("ok", false, "error", "WebUI file not found"));
-            return;
-        }
-        String name = resolved.getFileName().toString();
-        int dot = name.lastIndexOf('.');
-        String mime = dot >= 0 ? MIME.getOrDefault(name.substring(dot), "application/octet-stream") : "application/octet-stream";
-        byte[] bytes = Files.readAllBytes(resolved);
-        resp.setStatus(200);
-        resp.setContentType(mime);
-        resp.setHeader("Cache-Control", "no-store");
-        resp.setContentLength(bytes.length);
-        resp.getOutputStream().write(bytes);
-    }
-
     private void addCors(HttpServletResponse resp) {
-        if (corsOrigin != null && !corsOrigin.isBlank()) {
-            resp.setHeader("Access-Control-Allow-Origin", corsOrigin);
-        }
+        resp.setHeader("Access-Control-Allow-Origin", corsOrigin);
     }
 
     private void sendJson(HttpServletResponse resp, int status, Object body) throws IOException {
