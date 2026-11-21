@@ -197,12 +197,13 @@ final class McpEndpoints implements AutoCloseable {
                                     "minItems", 1,
                                     "maxItems", 50,
                                     "description", "Ordered list of edits. Ops: "
+                                            + "create_function{op,target,name?}, "
                                             + "rename_function{op,target,new_name}, "
                                             + "rename_var{op,function,var_name,new_name}, "
                                             + "set_var_type{op,function,var_name,type}, "
                                             + "rename_global{op,target,new_name,function?}, "
-                                            + "set_global_type{op,target,type,function?}, "
-                                            + "set_signature{op,target,signature}, "
+                                            + "set_global_type{op,target,type,allow_resize?,function?}, "
+                                            + "set_signature{op,target,signature,calling_convention?}, "
                                             + "set_comment{op,target,comment_type?(function|plate|pre|eol|var),var_name?,text}.",
                                     "items", Map.of("type", "object")))),
                     writeAnn, gson, (ex, args) -> edit.applyEdits(mode, actorName(ex), args)));

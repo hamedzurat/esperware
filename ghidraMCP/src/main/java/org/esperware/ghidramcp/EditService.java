@@ -1,26 +1,36 @@
 package org.esperware.ghidramcp;
 
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.cmd.function.DeleteFunctionCmd;
 import ghidra.app.util.cparser.C.CParser;
 import ghidra.app.util.parser.FunctionSignatureParser;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressOverflowException;
+import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.data.CategoryPath;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeConflictHandler;
 import ghidra.program.model.data.DataTypeManager;
 import ghidra.program.model.data.FunctionDefinition;
+import ghidra.program.model.data.InvalidDataTypeException;
 import ghidra.program.model.data.ParameterDefinition;
 import ghidra.program.model.data.StandAloneDataTypeManager;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.listing.Data;
+import ghidra.program.model.listing.DataIterator;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionSignature;
 import ghidra.program.model.listing.ParameterImpl;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.listing.Variable;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
 import ghidra.program.model.pcode.HighSymbol;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.util.data.DataTypeParser;
@@ -35,13 +45,18 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** Write-enabled mutation service enforcing AccessMode, CAS version checks, transactions, and inverse ops. */
 final class EditService {
     private static final int DECOMPILE_TIMEOUT_SEC = 30;
     private static final int MAX_BATCH_OPS = 50;
+    private static final int MAX_AUTO_GLOBAL_REFS = 10;
+    private static final Pattern SIG_NAME_PATTERN = Pattern.compile("^(.*?)\\b([A-Za-z_][A-Za-z0-9_]*)$");
 
     private final ProgramWorkspace ws;
     private final VersionStore store;
@@ -109,27 +124,30 @@ final class EditService {
                 List<Map<String, Object>> defined = new ArrayList<>();
                 List<Map<String, Object>> inverseOps = new ArrayList<>();
                 CategoryPath cat = new CategoryPath(categoryPath);
-                int tx = p.startTransaction("mcp:define_type");
                 try {
-                    for (DataType dt : parsedTypes) {
-                        DataType copy = dt.copy(targetDtm);
-                        copy.setCategoryPath(cat);
-                        String destPath = new CategoryPath(cat, copy.getName()).getPath();
-                        boolean existedBefore = targetDtm.getDataType(destPath) != null;
-                        DataType resolved = targetDtm.resolve(copy, DataTypeConflictHandler.REPLACE_HANDLER);
-                        defined.add(Map.of(
-                                "name", resolved.getName(),
-                                "path", resolved.getPathName(),
-                                "size", resolved.getLength()));
-                        if (!existedBefore) {
-                            // shortcut: define_type revert removes newly created types; restoring overwritten composite fields requires .gpr checkpoint.
-                            inverseOps.add(Map.of("op", "remove_type", "path", resolved.getPathName()));
+                    ws.runInTransaction(() -> {
+                        for (DataType dt : parsedTypes) {
+                            DataType copy = dt.copy(targetDtm);
+                            copy.setCategoryPath(cat);
+                            String destPath = new CategoryPath(cat, copy.getName()).getPath();
+                            boolean existedBefore = targetDtm.getDataType(destPath) != null;
+                            DataType resolved = targetDtm.resolve(copy, DataTypeConflictHandler.REPLACE_HANDLER);
+                            defined.add(Map.of(
+                                    "name", resolved.getName(),
+                                    "path", resolved.getPathName(),
+                                    "size", resolved.getLength()));
+                            if (!existedBefore) {
+                                // shortcut: define_type revert removes newly created types; restoring overwritten composite fields requires .gpr checkpoint.
+                                inverseOps.add(Map.of("op", "remove_type", "path", resolved.getPathName()));
+                            }
                         }
-                    }
-                    p.endTransaction(tx, true);
+                        return null;
+                    });
+                } catch (ApiError err) {
+                    throw new ApiError(err.code, err.getMessage(), current);
                 } catch (Exception ex) {
-                    p.endTransaction(tx, false);
-                    throw new ApiError("EDIT_FAILED", ex.getMessage(), current);
+                    throw new ApiError("EDIT_FAILED",
+                            ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(), current);
                 }
                 ws.invalidateCache();
                 Collections.reverse(inverseOps);
@@ -192,63 +210,90 @@ final class EditService {
         Program p = ws.program();
         long current = store.currentVersion();
 
-        // Pre-resolve touched functions & capture before_c once per function
-        Map<String, Function> touchedFunctions = new LinkedHashMap<>();
-        for (Map<String, Object> op : ops) {
-            Function fn = findTouchedFunction(op);
-            if (fn != null) touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
-        }
+        PreResolution pre;
         Map<String, String> beforeCode = new LinkedHashMap<>();
-        for (Map.Entry<String, Function> e : touchedFunctions.entrySet()) {
-            var d = ws.decompileCached(e.getValue(), DECOMPILE_TIMEOUT_SEC);
-            beforeCode.put(e.getKey(), "complete".equals(d.status()) ? d.code() : null);
-        }
-
-        List<Map<String, Object>> inverseOps = new ArrayList<>();
-        Map<String, HighFunction> liveHfCache = new HashMap<>();
-        Map<String, Map<String, String>> varRenameAliases = new HashMap<>();
-
-        int tx = p.startTransaction("mcp:" + operation);
+        List<List<Map<String, Object>>> perOpInverses = new ArrayList<>();
         try {
-            for (Map<String, Object> op : ops) {
-                Map<String, Object> inv = applyOp(op, liveHfCache, varRenameAliases);
-                if (inv != null) inverseOps.add(inv);
+            pre = preResolveTouchedFunctions(ops);
+            for (Map.Entry<String, Function> e : pre.touchedFunctions.entrySet()) {
+                var d = ws.decompileCached(e.getValue(), DECOMPILE_TIMEOUT_SEC);
+                beforeCode.put(e.getKey(), "complete".equals(d.status()) ? d.code() : null);
             }
-            p.endTransaction(tx, true);
+
+            Map<String, HighFunction> liveHfCache = new HashMap<>();
+            Map<String, Map<String, String>> varRenameAliases = new HashMap<>();
+
+            ws.runInTransaction(() -> {
+                for (Map<String, Object> op : ops) {
+                    List<Map<String, Object>> inv = applyOp(op, liveHfCache, varRenameAliases);
+                    if (inv != null && !inv.isEmpty()) perOpInverses.add(inv);
+                }
+                return null;
+            });
         } catch (ApiError err) {
-            p.endTransaction(tx, false);
             throw new ApiError(err.code, err.getMessage(), current);
         } catch (Exception ex) {
-            p.endTransaction(tx, false);
-            throw new ApiError("EDIT_FAILED", ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(), current);
+            throw new ApiError("EDIT_FAILED",
+                    ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(), current);
         }
 
         ws.invalidateCache();
 
+        for (String createdAddrStr : pre.pendingCreatedAddrs) {
+            Address createdAddr = ws.parseAddress(createdAddrStr);
+            if (createdAddr != null) {
+                Function createdFn = p.getFunctionManager().getFunctionAt(createdAddr);
+                if (createdFn != null) pre.touchedFunctions.putIfAbsent(createdAddrStr, createdFn);
+            }
+        }
+
         List<VersionStore.FunctionDiff> storedDiffs = new ArrayList<>();
         List<Map<String, Object>> apiDiffs = new ArrayList<>();
-        for (Map.Entry<String, Function> e : touchedFunctions.entrySet()) {
+        for (Map.Entry<String, Function> e : pre.touchedFunctions.entrySet()) {
             String addr = e.getKey();
-            Function fn = e.getValue();
-            ProgramWorkspace.LiveDecompile after = ws.decompileFresh(fn, DECOMPILE_TIMEOUT_SEC);
+            Function beforeFn = e.getValue();
+            Address entryAddr = ws.parseAddress(addr);
+            Function liveFn = entryAddr == null ? null : p.getFunctionManager().getFunctionAt(entryAddr);
             String before = beforeCode.get(addr);
+
+            if (liveFn == null) {
+                String delName = beforeFn.getName();
+                String diff = before != null ? ApiError.unifiedDiff(delName + " @ " + addr, before, "") : "";
+                storedDiffs.add(new VersionStore.FunctionDiff(addr, delName, before, "", diff, "deleted"));
+
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("function_address", addr);
+                entry.put("function_name", delName);
+                entry.put("decompile_status", "deleted");
+                entry.put("diff", diff);
+                entry.put("variables", List.of());
+                apiDiffs.add(entry);
+                continue;
+            }
+
+            ProgramWorkspace.LiveDecompile after = ws.decompileFresh(liveFn, DECOMPILE_TIMEOUT_SEC);
             String afterText = "complete".equals(after.status()) ? after.code() : null;
-            String diff = (before != null && afterText != null)
-                    ? ApiError.unifiedDiff(fn.getName() + " @ " + addr, before, afterText)
+            String effectiveBefore = before != null ? before : (pre.pendingCreatedAddrs.contains(addr) ? "" : null);
+            String diff = (effectiveBefore != null && afterText != null)
+                    ? ApiError.unifiedDiff(liveFn.getName() + " @ " + addr, effectiveBefore, afterText)
                     : "";
-            storedDiffs.add(new VersionStore.FunctionDiff(addr, fn.getName(), before, afterText, diff, after.status()));
+            storedDiffs.add(new VersionStore.FunctionDiff(addr, liveFn.getName(), effectiveBefore, afterText, diff, after.status()));
 
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("function_address", addr);
-            entry.put("function_name", fn.getName());
+            entry.put("function_name", liveFn.getName());
             entry.put("decompile_status", after.status());
             if (after.error() != null) entry.put("decompile_error", after.error());
             entry.put("diff", diff);
-            entry.put("variables", ws.extractVariables(fn, after.highFunction()));
+            entry.put("variables", ws.extractVariables(liveFn, after.highFunction()));
             apiDiffs.add(entry);
         }
 
-        Collections.reverse(inverseOps);
+        List<Map<String, Object>> inverseOps = new ArrayList<>();
+        Collections.reverse(perOpInverses);
+        for (List<Map<String, Object>> group : perOpInverses) {
+            inverseOps.addAll(group);
+        }
         long newVersion = store.recordVersion(actor, operation, reason, ops, inverseOps, storedDiffs);
 
         Map<String, Object> out = new LinkedHashMap<>();
@@ -259,31 +304,183 @@ final class EditService {
         return out;
     }
 
-    private Function findTouchedFunction(Map<String, Object> op) {
-        String kind = ApiError.reqStr(op, "op");
-        return switch (kind) {
-            case "rename_function", "set_signature" -> ws.resolveFunction(ApiError.reqStr(op, "target"));
-            case "rename_var", "set_var_type" -> ws.resolveFunction(ApiError.reqStr(op, "function"));
-            case "set_comment" -> {
-                String ctype = ApiError.optStr(op, "comment_type");
-                if ("var".equals(ctype) || "function".equals(ctype) || "plate".equals(ctype) || ctype == null) {
-                    String target = ApiError.reqStr(op, "target");
-                    Address a = ws.parseAddress(target);
-                    yield a != null ? ws.program().getFunctionManager().getFunctionContaining(a) : ws.resolveFunction(target);
+    private PreResolution preResolveTouchedFunctions(List<Map<String, Object>> ops) {
+        Program p = ws.program();
+        PreResolution pre = new PreResolution();
+        for (Map<String, Object> op : ops) {
+            String kind = ApiError.reqStr(op, "op");
+            switch (kind) {
+                case "create_function" -> {
+                    Address addr = ws.parseAddress(ApiError.reqStr(op, "target"));
+                    if (addr == null) throw new ApiError("INVALID_ARGUMENT", "Invalid address for create_function", null);
+                    String addrKey = addr.toString();
+                    pre.pendingCreatedAddrs.add(addrKey);
+                    String name = ApiError.optStr(op, "name");
+                    if (name != null) pre.pendingCreatedNames.put(name.toLowerCase(Locale.ROOT), addrKey);
                 }
-                Address a = ws.parseAddress(ApiError.reqStr(op, "target"));
-                yield a == null ? null : ws.program().getFunctionManager().getFunctionContaining(a);
+                case "rename_function" -> {
+                    String target = ApiError.reqStr(op, "target");
+                    String newName = ApiError.reqStr(op, "new_name");
+                    Function fn = resolvePreFunction(target, pre);
+                    if (fn != null) {
+                        pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
+                        pre.fnAliases.put(newName.toLowerCase(Locale.ROOT), fn);
+                    } else {
+                        String pending = pendingCreatedAddr(target, pre);
+                        if (pending != null) pre.pendingCreatedNames.put(newName.toLowerCase(Locale.ROOT), pending);
+                    }
+                }
+                case "set_signature" -> {
+                    String target = ApiError.reqStr(op, "target");
+                    String sig = ApiError.reqStr(op, "signature");
+                    Function fn = resolvePreFunction(target, pre);
+                    if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
+                    String sigName = extractSignatureName(sig);
+                    if (sigName != null) {
+                        if (fn != null) pre.fnAliases.put(sigName.toLowerCase(Locale.ROOT), fn);
+                        else {
+                            String pending = pendingCreatedAddr(target, pre);
+                            if (pending != null) pre.pendingCreatedNames.put(sigName.toLowerCase(Locale.ROOT), pending);
+                        }
+                    }
+                }
+                case "rename_var", "set_var_type" -> {
+                    Function fn = resolvePreFunction(ApiError.reqStr(op, "function"), pre);
+                    if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
+                }
+                case "delete_function" -> {
+                    Function fn = resolvePreFunction(ApiError.reqStr(op, "target"), pre);
+                    if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
+                }
+                case "set_comment" -> {
+                    String ctype = ApiError.optStr(op, "comment_type");
+                    String target = ApiError.reqStr(op, "target");
+                    if ("var".equals(ctype) || "function".equals(ctype) || "plate".equals(ctype) || ctype == null) {
+                        Function fn = resolvePreFunction(target, pre);
+                        if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
+                    } else {
+                        Address a = ws.parseAddress(target);
+                        Function fn = a == null ? null : p.getFunctionManager().getFunctionContaining(a);
+                        if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
+                    }
+                }
+                case "rename_global", "set_global_type" -> {
+                    String target = ApiError.reqStr(op, "target");
+                    Address gAddr = resolveGlobalAddrForPre(target, pre);
+                    if ("rename_global".equals(kind) && gAddr != null) {
+                        String newName = ApiError.reqStr(op, "new_name");
+                        pre.globalAliases.put(newName.toLowerCase(Locale.ROOT), gAddr);
+                    }
+                    String fnHint = ApiError.optStr(op, "function");
+                    if (fnHint != null) {
+                        Function fn = resolvePreFunction(fnHint, pre);
+                        if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
+                    } else if (gAddr != null) {
+                        Address scanEnd = computeGlobalScanEnd(p, gAddr, kind, op);
+                        addReferencingFunctions(p, gAddr, scanEnd, pre.touchedFunctions, MAX_AUTO_GLOBAL_REFS);
+                    }
+                }
+                case "remove_type", "clear_data" -> {
+                    String fnHint = ApiError.optStr(op, "function");
+                    if (fnHint != null) {
+                        Function fn = resolvePreFunction(fnHint, pre);
+                        if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
+                    }
+                }
+                default -> throw new ApiError("INVALID_ARGUMENT", "Unsupported edit op: " + kind, null);
             }
-            case "rename_global", "set_global_type" -> {
-                String fnHint = ApiError.optStr(op, "function");
-                yield fnHint == null ? null : ws.resolveFunction(fnHint);
-            }
-            case "remove_type" -> null;
-            default -> throw new ApiError("INVALID_ARGUMENT", "Unsupported edit op: " + kind, store.currentVersion());
-        };
+        }
+        return pre;
     }
 
-    private Map<String, Object> applyOp(
+    private Function resolvePreFunction(String target, PreResolution pre) {
+        Program p = ws.program();
+        Address addr = ws.parseAddress(target);
+        if (addr != null) {
+            if (pre.pendingCreatedAddrs.contains(addr.toString())) return null;
+            Function exact = p.getFunctionManager().getFunctionAt(addr);
+            if (exact != null) return exact;
+            Function containing = p.getFunctionManager().getFunctionContaining(addr);
+            if (containing != null) return containing;
+            return ws.resolveFunction(target);
+        }
+        String key = target.trim().toLowerCase(Locale.ROOT);
+        if (pre.fnAliases.containsKey(key)) return pre.fnAliases.get(key);
+        if (pre.pendingCreatedNames.containsKey(key)) return null;
+        return ws.resolveFunction(target);
+    }
+
+    private String pendingCreatedAddr(String target, PreResolution pre) {
+        Address addr = ws.parseAddress(target);
+        if (addr != null && pre.pendingCreatedAddrs.contains(addr.toString())) {
+            return addr.toString();
+        }
+        return pre.pendingCreatedNames.get(target.trim().toLowerCase(Locale.ROOT));
+    }
+
+    private static String extractSignatureName(String sig) {
+        int paren = sig.indexOf('(');
+        if (paren <= 0) return null;
+        String head = sig.substring(0, paren).stripTrailing();
+        Matcher m = SIG_NAME_PATTERN.matcher(head);
+        if (!m.matches() || m.group(1).isBlank()) return null;
+        return m.group(2);
+    }
+
+    private Address resolveGlobalAddrForPre(String target, PreResolution pre) {
+        Address addr = ws.parseAddress(target);
+        if (addr != null) return addr;
+        Address aliased = pre.globalAliases.get(target.trim().toLowerCase(Locale.ROOT));
+        if (aliased != null) return aliased;
+        List<Symbol> found = ws.program().getSymbolTable().getGlobalSymbols(target.trim());
+        return found.size() == 1 ? found.getFirst().getAddress() : null;
+    }
+
+    private Address computeGlobalScanEnd(Program p, Address start, String kind, Map<String, Object> op) {
+        Address scanEnd = start;
+        Data existing = p.getListing().getDefinedDataAt(start);
+        if (existing != null && existing.getMaxAddress().compareTo(scanEnd) > 0) {
+            scanEnd = existing.getMaxAddress();
+        }
+        if ("set_global_type".equals(kind)) {
+            String typeSpec = ApiError.optStr(op, "type");
+            if (typeSpec != null) {
+                try {
+                    DataType dt = parseType(typeSpec);
+                    if (dt.getLength() > 0) {
+                        Address end = start.addNoWrap(dt.getLength() - 1L);
+                        if (end.compareTo(scanEnd) > 0) scanEnd = end;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return scanEnd;
+    }
+
+    private static void addReferencingFunctions(
+            Program p,
+            Address start,
+            Address end,
+            Map<String, Function> touchedFunctions,
+            int maxFuncs) {
+        var refMgr = p.getReferenceManager();
+        var destIt = refMgr.getReferenceDestinationIterator(new AddressSet(start, end), true);
+        int added = 0;
+        while (destIt.hasNext() && added < maxFuncs) {
+            Address dest = destIt.next();
+            ReferenceIterator refs = refMgr.getReferencesTo(dest);
+            while (refs.hasNext() && added < maxFuncs) {
+                Reference ref = refs.next();
+                Function refFn = p.getFunctionManager().getFunctionContaining(ref.getFromAddress());
+                if (refFn != null && touchedFunctions.putIfAbsent(refFn.getEntryPoint().toString(), refFn) == null) {
+                    added++;
+                }
+            }
+        }
+    }
+
+    private List<Map<String, Object>> applyOp(
             Map<String, Object> op,
             Map<String, HighFunction> liveHfCache,
             Map<String, Map<String, String>> varRenameAliases) throws Exception {
@@ -296,7 +493,7 @@ final class EditService {
                 String oldName = fn.getName();
                 String newName = ApiError.reqStr(op, "new_name");
                 fn.setName(newName, SourceType.USER_DEFINED);
-                yield Map.of("op", "rename_function", "target", fn.getEntryPoint().toString(), "new_name", oldName);
+                yield List.of(Map.of("op", "rename_function", "target", fn.getEntryPoint().toString(), "new_name", oldName));
             }
             case "rename_var" -> {
                 Function fn = ws.resolveFunction(ApiError.reqStr(op, "function"));
@@ -311,7 +508,7 @@ final class EditService {
                 varRenameAliases.computeIfAbsent(fnAddr, k -> new HashMap<>()).put(requestedName, newName);
                 varRenameAliases.get(fnAddr).put(newName, newName);
                 liveHfCache.remove(fnAddr);
-                yield Map.of("op", "rename_var", "function", fnAddr, "var_name", newName, "new_name", oldName);
+                yield List.of(Map.of("op", "rename_var", "function", fnAddr, "var_name", newName, "new_name", oldName));
             }
             case "set_var_type" -> {
                 Function fn = ws.resolveFunction(ApiError.reqStr(op, "function"));
@@ -324,81 +521,253 @@ final class EditService {
                 String oldPath = vh.dataTypePath();
                 vh.setType(dt);
                 liveHfCache.remove(fnAddr);
-                yield Map.of("op", "set_var_type", "function", fnAddr, "var_name", vh.name(), "type", oldPath);
+                yield List.of(Map.of("op", "set_var_type", "function", fnAddr, "var_name", vh.name(), "type", oldPath));
             }
-            case "rename_global" -> {
-                GlobalHandle gh = resolveGlobal(ApiError.reqStr(op, "target"));
-                String oldName = gh.symbol.getName();
-                String newName = ApiError.reqStr(op, "new_name");
-                gh.symbol.setName(newName, SourceType.USER_DEFINED);
-                Map<String, Object> inv = new LinkedHashMap<>();
-                inv.put("op", "rename_global");
-                inv.put("target", gh.address.toString());
-                inv.put("new_name", oldName);
-                String fnHint = ApiError.optStr(op, "function");
-                if (fnHint != null) inv.put("function", fnHint);
-                yield inv;
-            }
-            case "set_global_type" -> {
-                GlobalHandle gh = resolveGlobal(ApiError.reqStr(op, "target"));
-                Data data = p.getListing().getDefinedDataAt(gh.address);
-                if (data == null) {
-                    throw new ApiError("GLOBAL_DATA_NOT_DEFINED", "Global data not defined at " + gh.address, null);
-                }
-                String oldPath = data.getDataType().getPathName();
-                int oldLen = data.getLength();
-                int allowedLen = op.get("allowed_length") instanceof Number n ? n.intValue() : oldLen;
-                DataType newType = parseType(ApiError.reqStr(op, "type"));
-                int newLen = newType.getLength();
-                if (newLen <= 0 || newLen > allowedLen) {
-                    throw new ApiError("UNSAFE_GLOBAL_TYPE",
-                            "Type size " + newLen + " invalid or exceeds allowed size " + allowedLen, null);
-                }
-                Map<CommentType, String> savedComments = captureComments(data);
-                Address end = gh.address.add(Math.max(oldLen, newLen) - 1L);
-                p.getListing().clearCodeUnits(gh.address, end, false);
-                Data newData = p.getListing().createData(gh.address, newType);
-                for (Map.Entry<CommentType, String> ce : savedComments.entrySet()) {
-                    newData.setComment(ce.getKey(), ce.getValue());
-                }
-                Map<String, Object> inv = new LinkedHashMap<>();
-                inv.put("op", "set_global_type");
-                inv.put("target", gh.address.toString());
-                inv.put("type", oldPath);
-                inv.put("allowed_length", allowedLen);
-                String fnHint = ApiError.optStr(op, "function");
-                if (fnHint != null) inv.put("function", fnHint);
-                yield inv;
-            }
-            case "set_signature" -> {
-                Function fn = ws.resolveFunction(ApiError.reqStr(op, "target"));
-                String oldSig = fn.getPrototypeString(false, true);
-                String newSig = ApiError.reqStr(op, "signature");
-                FunctionSignatureParser parser = new FunctionSignatureParser(p.getDataTypeManager(), null);
-                FunctionDefinition def = parser.parse((FunctionSignature) fn.getSignature(), newSig);
-                List<Variable> params = new ArrayList<>();
-                for (ParameterDefinition pd : def.getArguments()) {
-                    params.add(new ParameterImpl(pd.getName(), pd.getDataType(), p, SourceType.USER_DEFINED));
-                }
-                fn.setReturnType(def.getReturnType(), SourceType.USER_DEFINED);
-                fn.updateFunction(null, null, params,
-                        Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, true, SourceType.USER_DEFINED);
-                if (def.getName() != null && !def.getName().isBlank() && !def.getName().equals(fn.getName())) {
-                    fn.setName(def.getName(), SourceType.USER_DEFINED);
-                }
-                liveHfCache.remove(fn.getEntryPoint().toString());
-                yield Map.of("op", "set_signature", "target", fn.getEntryPoint().toString(),
-                        "signature", oldSig);
-            }
-            case "set_comment" -> applyComment(op, liveHfCache, varRenameAliases);
+            case "rename_global" -> List.of(renameGlobalOp(op));
+            case "set_global_type" -> setGlobalTypeOp(op);
+            case "clear_data" -> clearDataOp(op);
+            case "set_signature" -> List.of(setSignatureOp(op, liveHfCache));
+            case "create_function" -> createFunctionOp(op);
+            case "delete_function" -> deleteFunctionOp(op, liveHfCache);
+            case "set_comment" -> List.of(applyComment(op, liveHfCache, varRenameAliases));
             case "remove_type" -> {
                 String path = ApiError.reqStr(op, "path");
                 DataType dt = p.getDataTypeManager().getDataType(path);
                 if (dt != null) p.getDataTypeManager().remove(dt);
-                yield null;
+                yield List.of();
             }
             default -> throw new ApiError("INVALID_ARGUMENT", "Unsupported edit op: " + kind, null);
         };
+    }
+
+    private Map<String, Object> renameGlobalOp(Map<String, Object> op) throws Exception {
+        GlobalHandle gh = resolveGlobal(ApiError.reqStr(op, "target"));
+        String oldName = gh.symbol.getName();
+        String newName = ApiError.reqStr(op, "new_name");
+        gh.symbol.setName(newName, SourceType.USER_DEFINED);
+        Map<String, Object> inv = new LinkedHashMap<>();
+        inv.put("op", "rename_global");
+        inv.put("target", gh.address.toString());
+        inv.put("new_name", oldName);
+        String fnHint = ApiError.optStr(op, "function");
+        if (fnHint != null) inv.put("function", fnHint);
+        return inv;
+    }
+
+    private List<Map<String, Object>> setGlobalTypeOp(Map<String, Object> op) throws Exception {
+        Program p = ws.program();
+        String target = ApiError.reqStr(op, "target");
+        Address addr = ws.parseAddress(target);
+        if (addr == null) addr = resolveGlobal(target).address;
+
+        DataType newType = parseType(ApiError.reqStr(op, "type"));
+        int newLen = newType.getLength();
+        if (newLen <= 0) {
+            throw new ApiError("UNSAFE_GLOBAL_TYPE", "Global data type must have fixed positive size", null);
+        }
+
+        Address end;
+        try {
+            end = addr.addNoWrap(newLen - 1L);
+        } catch (AddressOverflowException ex) {
+            throw new ApiError("UNSAFE_GLOBAL_TYPE", "Type extends past end of address space", null);
+        }
+
+        MemoryBlock block = p.getMemory().getBlock(addr);
+        if (block == null || !block.contains(end) || block.isExecute()) {
+            throw new ApiError("UNSAFE_GLOBAL_TYPE",
+                    "Target range [" + addr + ".." + end + "] is not within non-executable memory", null);
+        }
+        if (p.getListing().getInstructions(new AddressSet(addr, end), true).hasNext()) {
+            throw new ApiError("UNSAFE_GLOBAL_TYPE",
+                    "Target range [" + addr + ".." + end + "] contains decoded instructions", null);
+        }
+
+        Data containing = p.getListing().getDefinedDataContaining(addr);
+        if (containing != null && !containing.getAddress().equals(addr)) {
+            throw new ApiError("UNSAFE_GLOBAL_TYPE",
+                    "Address " + addr + " is inside existing data unit at " + containing.getAddress()
+                            + "; target the base address instead", null);
+        }
+
+        Data existingAtStart = p.getListing().getDefinedDataAt(addr);
+        boolean allowResize = ApiError.optBool(op, "allow_resize", false);
+        if (!allowResize && op.get("allowed_length") instanceof Number n) {
+            allowResize = newLen <= n.intValue();
+        }
+        if (!allowResize) {
+            if (existingAtStart != null && newLen > existingAtStart.getLength()) {
+                throw new ApiError("UNSAFE_GLOBAL_TYPE",
+                        "Type size " + newLen + " exceeds existing data size " + existingAtStart.getLength()
+                                + " at " + addr + "; pass allow_resize=true to replace overlapping data units", null);
+            }
+            if (existingAtStart == null && p.getListing().getDefinedData(new AddressSet(addr, end), true).hasNext()) {
+                throw new ApiError("UNSAFE_GLOBAL_TYPE",
+                        "Type overlaps existing defined data; pass allow_resize=true to replace", null);
+            }
+        }
+
+        Address clearEnd = end;
+        if (existingAtStart != null && existingAtStart.getMaxAddress().compareTo(clearEnd) > 0) {
+            clearEnd = existingAtStart.getMaxAddress();
+        }
+        Data tail = p.getListing().getDefinedDataContaining(clearEnd);
+        if (tail != null && tail.getMaxAddress().compareTo(clearEnd) > 0) {
+            clearEnd = tail.getMaxAddress();
+        }
+
+        List<CapturedData> priorUnits = captureDataUnitsInRange(p, addr, clearEnd);
+        Map<CommentType, String> preservedStartComments = existingAtStart != null ? captureComments(existingAtStart) : Map.of();
+
+        p.getListing().clearCodeUnits(addr, clearEnd, false);
+        Data newData = p.getListing().createData(addr, newType);
+        applyCommentsToData(newData, preservedStartComments, op.get("comments"));
+
+        String fnHint = ApiError.optStr(op, "function");
+        long clearLen = clearEnd.subtract(addr) + 1L;
+        List<Map<String, Object>> inv = new ArrayList<>();
+        Map<String, Object> clearInv = new LinkedHashMap<>();
+        clearInv.put("op", "clear_data");
+        clearInv.put("target", addr.toString());
+        clearInv.put("length", clearLen);
+        if (fnHint != null) clearInv.put("function", fnHint);
+        inv.add(clearInv);
+        for (CapturedData cd : priorUnits) {
+            inv.add(cd.toRestoreOp(fnHint));
+        }
+        return inv;
+    }
+
+    private List<Map<String, Object>> clearDataOp(Map<String, Object> op) throws Exception {
+        Program p = ws.program();
+        String target = ApiError.reqStr(op, "target");
+        Address addr = ws.parseAddress(target);
+        if (addr == null) throw new ApiError("INVALID_ARGUMENT", "Invalid address for clear_data: " + target, null);
+        int len = ApiError.optInt(op, "length", 1, 1, 65536);
+
+        Address end;
+        try {
+            end = addr.addNoWrap(len - 1L);
+        } catch (AddressOverflowException ex) {
+            throw new ApiError("UNSAFE_GLOBAL_TYPE", "clear_data extends past address space", null);
+        }
+        MemoryBlock block = p.getMemory().getBlock(addr);
+        if (block == null || !block.contains(end) || block.isExecute()) {
+            throw new ApiError("UNSAFE_GLOBAL_TYPE", "clear_data target must be in non-executable memory", null);
+        }
+        if (p.getListing().getInstructions(new AddressSet(addr, end), true).hasNext()) {
+            throw new ApiError("UNSAFE_GLOBAL_TYPE", "clear_data range contains decoded instructions", null);
+        }
+
+        List<CapturedData> priorUnits = captureDataUnitsInRange(p, addr, end);
+        p.getListing().clearCodeUnits(addr, end, false);
+        String fnHint = ApiError.optStr(op, "function");
+        List<Map<String, Object>> inv = new ArrayList<>(priorUnits.size());
+        for (CapturedData cd : priorUnits) {
+            inv.add(cd.toRestoreOp(fnHint));
+        }
+        return inv;
+    }
+
+    private Map<String, Object> setSignatureOp(Map<String, Object> op, Map<String, HighFunction> liveHfCache) throws Exception {
+        Program p = ws.program();
+        Function fn = ws.resolveFunction(ApiError.reqStr(op, "target"));
+        String oldSig = fn.getPrototypeString(false, true);
+        String oldCc = fn.getCallingConventionName();
+        String newSig = ApiError.reqStr(op, "signature");
+        String explicitCc = ApiError.optStr(op, "calling_convention");
+
+        FunctionSignatureParser parser = new FunctionSignatureParser(p.getDataTypeManager(), null);
+        FunctionDefinition def = parser.parse((FunctionSignature) fn.getSignature(), newSig);
+        List<Variable> params = new ArrayList<>();
+        for (ParameterDefinition pd : def.getArguments()) {
+            params.add(new ParameterImpl(pd.getName(), pd.getDataType(), p, SourceType.USER_DEFINED));
+        }
+
+        String parsedCc = def.getCallingConventionName();
+        String targetCc;
+        if (explicitCc != null) {
+            targetCc = explicitCc;
+        } else if (parsedCc != null && !parsedCc.isBlank()
+                && !Function.UNKNOWN_CALLING_CONVENTION_STRING.equals(parsedCc)) {
+            targetCc = parsedCc;
+        } else if (fn.hasUnknownCallingConventionName()) {
+            targetCc = Function.DEFAULT_CALLING_CONVENTION_STRING;
+        } else {
+            targetCc = null;
+        }
+
+        fn.setReturnType(def.getReturnType(), SourceType.USER_DEFINED);
+        fn.updateFunction(targetCc, null, params,
+                Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, true, SourceType.USER_DEFINED);
+        if (def.getName() != null && !def.getName().isBlank() && !def.getName().equals(fn.getName())) {
+            fn.setName(def.getName(), SourceType.USER_DEFINED);
+        }
+        liveHfCache.remove(fn.getEntryPoint().toString());
+        return Map.of(
+                "op", "set_signature",
+                "target", fn.getEntryPoint().toString(),
+                "signature", oldSig,
+                "calling_convention", oldCc == null ? Function.UNKNOWN_CALLING_CONVENTION_STRING : oldCc);
+    }
+
+    private List<Map<String, Object>> createFunctionOp(Map<String, Object> op) {
+        Program p = ws.program();
+        String target = ApiError.reqStr(op, "target");
+        Address addr = ws.parseAddress(target);
+        if (addr == null) throw new ApiError("INVALID_ARGUMENT", "Invalid address for create_function: " + target, null);
+        String name = ApiError.optStr(op, "name");
+
+        MemoryBlock block = p.getMemory().getBlock(addr);
+        if (block == null || !block.isExecute()) {
+            throw new ApiError("INVALID_ARGUMENT", "Address " + addr + " is not in executable memory", null);
+        }
+        if (p.getFunctionManager().getFunctionAt(addr) != null) {
+            throw new ApiError("FUNCTION_EXISTS", "Function already exists at " + addr, null);
+        }
+        Function containing = p.getFunctionManager().getFunctionContaining(addr);
+        if (containing != null) {
+            throw new ApiError("INVALID_ARGUMENT",
+                    "Address " + addr + " is already inside function " + containing.getName() + " @ " + containing.getEntryPoint(), null);
+        }
+
+        if (p.getListing().getInstructionAt(addr) == null) {
+            DisassembleCommand dis = new DisassembleCommand(addr, null, true);
+            dis.enableCodeAnalysis(false);
+            dis.applyTo(p, TaskMonitor.DUMMY);
+            if (p.getListing().getInstructionAt(addr) == null) {
+                throw new ApiError("EDIT_FAILED", "No valid instruction to disassemble at " + addr, null);
+            }
+        }
+
+        SourceType src = name != null ? SourceType.USER_DEFINED : SourceType.ANALYSIS;
+        CreateFunctionCmd cmd = new CreateFunctionCmd(name, addr, null, src);
+        boolean ok = cmd.applyTo(p, TaskMonitor.DUMMY);
+        Function created = cmd.getFunction() != null ? cmd.getFunction() : p.getFunctionManager().getFunctionAt(addr);
+        if (!ok || created == null) {
+            String detail = cmd.getStatusMsg() != null ? ": " + cmd.getStatusMsg() : "";
+            throw new ApiError("EDIT_FAILED", "Could not create function at " + addr + detail, null);
+        }
+        return List.of(Map.of("op", "delete_function", "target", addr.toString()));
+    }
+
+    private List<Map<String, Object>> deleteFunctionOp(Map<String, Object> op, Map<String, HighFunction> liveHfCache) {
+        Program p = ws.program();
+        Function fn = ws.resolveFunction(ApiError.reqStr(op, "target"));
+        Address entry = fn.getEntryPoint();
+        String oldName = fn.getSymbol().getSource() == SourceType.USER_DEFINED ? fn.getName() : null;
+
+        DeleteFunctionCmd cmd = new DeleteFunctionCmd(entry);
+        if (!cmd.applyTo(p) || p.getFunctionManager().getFunctionAt(entry) != null) {
+            String detail = cmd.getStatusMsg() != null ? ": " + cmd.getStatusMsg() : "";
+            throw new ApiError("EDIT_FAILED", "Could not delete function at " + entry + detail, null);
+        }
+        liveHfCache.remove(entry.toString());
+        Map<String, Object> inv = new LinkedHashMap<>();
+        inv.put("op", "create_function");
+        inv.put("target", entry.toString());
+        if (oldName != null) inv.put("name", oldName);
+        return List.of(inv);
     }
 
     private Map<String, Object> applyComment(
@@ -487,10 +856,65 @@ final class EditService {
     }
 
     private DataType parseType(String typeSpec) throws Exception {
+        String trimmed = typeSpec.trim();
         DataTypeManager dtm = ws.program().getDataTypeManager();
-        DataType direct = dtm.getDataType(typeSpec);
+        DataType direct = dtm.getDataType(trimmed);
         if (direct != null) return direct;
-        return new DataTypeParser(null, dtm, null, DataTypeParser.AllowedDataTypes.ALL).parse(typeSpec);
+
+        DataTypeParser parser = new DataTypeParser(dtm, dtm, null, DataTypeParser.AllowedDataTypes.ALL);
+        try {
+            if (trimmed.startsWith("/")) {
+                int modIdx = firstModifierIndex(trimmed);
+                String prefix = modIdx >= 0 ? trimmed.substring(0, modIdx) : trimmed;
+                int slash = prefix.lastIndexOf('/');
+                if (slash >= 0) {
+                    String catText = slash == 0 ? "/" : prefix.substring(0, slash);
+                    String rest = trimmed.substring(slash + 1).trim();
+                    return parser.parse(rest, new CategoryPath(catText));
+                }
+            }
+            return parser.parse(trimmed);
+        } catch (InvalidDataTypeException ex) {
+            String baseName = extractBaseTypeName(trimmed);
+            if (!baseName.isEmpty()) {
+                List<DataType> matches = new ArrayList<>();
+                dtm.findDataTypes(baseName, matches);
+                if (matches.size() > 1) {
+                    List<String> paths = matches.stream().limit(5).map(DataType::getPathName).toList();
+                    throw new ApiError("AMBIGUOUS_TYPE",
+                            "Ambiguous data type '" + typeSpec + "'; specify full path: " + paths, null);
+                }
+            }
+            throw new ApiError("INVALID_TYPE", ex.getMessage() == null ? "Invalid data type: " + typeSpec : ex.getMessage(), null);
+        }
+    }
+
+    private static int firstModifierIndex(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch == '*' || ch == '[' || Character.isWhitespace(ch)) return i;
+        }
+        return -1;
+    }
+
+    private static String extractBaseTypeName(String spec) {
+        int mod = firstModifierIndex(spec);
+        String base = mod >= 0 ? spec.substring(0, mod) : spec;
+        int slash = base.lastIndexOf('/');
+        return slash >= 0 ? base.substring(slash + 1).trim() : base.trim();
+    }
+
+    private static List<CapturedData> captureDataUnitsInRange(Program p, Address start, Address end) {
+        List<CapturedData> list = new ArrayList<>();
+        DataIterator it = p.getListing().getDefinedData(new AddressSet(start, end), true);
+        while (it.hasNext()) {
+            Data d = it.next();
+            list.add(new CapturedData(
+                    d.getAddress().toString(),
+                    d.getDataType().getPathName(),
+                    commentsToStringMap(captureComments(d))));
+        }
+        return list;
     }
 
     private static Map<CommentType, String> captureComments(Data data) {
@@ -502,6 +926,31 @@ final class EditService {
         return map;
     }
 
+    private static Map<String, String> commentsToStringMap(Map<CommentType, String> comments) {
+        if (comments.isEmpty()) return Map.of();
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<CommentType, String> e : comments.entrySet()) {
+            out.put(e.getKey().name(), e.getValue());
+        }
+        return out;
+    }
+
+    private static void applyCommentsToData(Data data, Map<CommentType, String> captured, Object opCommentsObj) {
+        for (Map.Entry<CommentType, String> ce : captured.entrySet()) {
+            data.setComment(ce.getKey(), ce.getValue());
+        }
+        if (opCommentsObj instanceof Map<?, ?> rawMap) {
+            for (Map.Entry<?, ?> entry : rawMap.entrySet()) {
+                if (entry.getKey() == null || entry.getValue() == null) continue;
+                try {
+                    CommentType ct = CommentType.valueOf(String.valueOf(entry.getKey()));
+                    data.setComment(ct, String.valueOf(entry.getValue()));
+                } catch (IllegalArgumentException ignored) {
+                }
+            }
+        }
+    }
+
     private static void requireWrite(ApiError.AccessMode mode) {
         if (mode != ApiError.AccessMode.READ_WRITE) {
             throw new ApiError("READ_ONLY", "Write operations are forbidden on read-only endpoints", null);
@@ -509,6 +958,27 @@ final class EditService {
     }
 
     private record GlobalHandle(Symbol symbol, Address address) {}
+
+    private record CapturedData(String address, String typePath, Map<String, String> comments) {
+        Map<String, Object> toRestoreOp(String fnHint) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("op", "set_global_type");
+            m.put("target", address);
+            m.put("type", typePath);
+            m.put("allow_resize", true);
+            if (!comments.isEmpty()) m.put("comments", comments);
+            if (fnHint != null) m.put("function", fnHint);
+            return m;
+        }
+    }
+
+    private static final class PreResolution {
+        final Map<String, Function> touchedFunctions = new LinkedHashMap<>();
+        final Map<String, Function> fnAliases = new HashMap<>();
+        final Set<String> pendingCreatedAddrs = new LinkedHashSet<>();
+        final Map<String, String> pendingCreatedNames = new HashMap<>();
+        final Map<String, Address> globalAliases = new HashMap<>();
+    }
 
     private interface VarHandle {
         String name();

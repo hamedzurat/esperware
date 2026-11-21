@@ -150,6 +150,11 @@ async function loadRangeDiff() {
   showTab('diff');
   const f = document.getElementById('fromVer').value, t = document.getElementById('toVer').value;
   const data = await (await fetch(api(`/api/v1/diff?from=${f}&to=${t}`))).json();
+  if (!data.ok) {
+    document.getElementById('viewTitle').textContent = `Diff v${f} → v${t} (error)`;
+    document.getElementById('diffView').innerHTML = `<div class="muted">${esc(data.error || 'Failed to load diff.')}</div>`;
+    return;
+  }
   document.getElementById('viewTitle').textContent = `Cumulative Diff v${f} → v${t}`;
   document.getElementById('diffView').innerHTML = (data.diffs || []).length
     ? data.diffs.map(d => `<h4>${esc(d.function_name)} (${esc(d.function_address)})</h4>${renderDiffText(d.diff)}`).join('')

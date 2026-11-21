@@ -5,6 +5,7 @@ import ghidra.app.decompiler.DecompileResults;
 import ghidra.base.project.GhidraProject;
 import ghidra.framework.Application;
 import ghidra.framework.model.DomainFile;
+import ghidra.framework.model.TransactionInfo;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.listing.CommentType;
@@ -177,6 +178,31 @@ final class ProgramWorkspace implements AutoCloseable {
             return work.run();
         } finally {
             rwLock.writeLock().unlock();
+        }
+    }
+
+    /** Runs mutations inside GhidraProject's managed transaction, committing via checkPoint or rolling back on failure. */
+    <T> T runInTransaction(CheckedWork<T> work) throws Exception {
+        try {
+            T result = work.run();
+            TransactionInfo info = program.getCurrentTransactionInfo();
+            if (info != null && info.getStatus() == TransactionInfo.Status.ABORTED) {
+                project.rollback(program);
+                invalidateCache();
+                throw new ApiError("EDIT_FAILED", "Transaction was aborted by an internal Ghidra operation", null);
+            }
+            project.checkPoint(program);
+            return result;
+        } catch (Throwable t) {
+            try {
+                project.rollback(program);
+            } catch (Throwable rollbackEx) {
+                t.addSuppressed(rollbackEx);
+            }
+            invalidateCache();
+            if (t instanceof Exception e) throw e;
+            if (t instanceof Error e) throw e;
+            throw new RuntimeException(t);
         }
     }
 

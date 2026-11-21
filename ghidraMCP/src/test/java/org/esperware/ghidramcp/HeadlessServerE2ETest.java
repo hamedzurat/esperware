@@ -145,6 +145,10 @@ class HeadlessServerE2ETest {
             }
         }
         assertNotNull(localVar, "Expected local variable in transform");
+        JsonArray refGlobals = dec.getAsJsonArray("globals");
+        assertTrue(refGlobals.size() >= 2, "Expected >=2 referenced globals in transform");
+        String g0Addr = refGlobals.get(0).getAsJsonObject().get("address").getAsString();
+        String g1Addr = refGlobals.get(1).getAsJsonObject().get("address").getAsString();
 
         JsonObject dis = ro.callOk("disassemble", Map.of("target", transformAddr, "max_instructions", 10));
         JsonArray insns = dis.getAsJsonArray("instructions");
@@ -154,6 +158,22 @@ class HeadlessServerE2ETest {
             pat.append(insns.get(i).getAsJsonObject().get("bytes").getAsString());
         }
         String firstBytes = pat.substring(0, Math.min(6, pat.length()));
+
+        // Locate main() address passed in RDI by entry -> __libc_start_main
+        JsonObject entryDis = ro.callOk("disassemble", Map.of("target", "entry", "max_instructions", 30));
+        String mainAddr = null;
+        for (JsonElement el : entryDis.getAsJsonArray("instructions")) {
+            JsonObject ins = el.getAsJsonObject();
+            String mn = ins.get("mnemonic").getAsString();
+            String ops = ins.get("operands").getAsString();
+            if ("MOV".equals(mn) && ops.startsWith("RDI,0x")) {
+                mainAddr = ops.substring("RDI,".length()).trim();
+                break;
+            }
+        }
+        assertNotNull(mainAddr, "Expected MOV RDI,0x... in entry disassembly");
+        assertTrue(ro.callRaw("decompile", Map.of("target", mainAddr)).isError(),
+                "Expected main before create_function to be unrecovered");
 
         JsonObject mem = ro.callOk("read_memory", Map.of("address", transformAddr, "size", 16, "format", "hex"));
         assertEquals(16, mem.get("size").getAsInt());
@@ -185,18 +205,88 @@ class HeadlessServerE2ETest {
         JsonObject customTypes = ro.callOk("get_type", Map.of("query", "ProbeState"));
         assertTrue(customTypes.getAsJsonArray("types").size() > 0);
 
+        // Intra-batch rename_function -> reference by NEW name ("transform_fn") in rename_global
         JsonObject batch = rw.callOk("apply_edits", Map.of(
                 "expected_version", 1,
                 "reason", "clean up transform",
                 "edits", List.of(
                         Map.of("op", "rename_function", "target", transformAddr, "new_name", "transform_fn"),
-                        Map.of("op", "rename_var", "function", transformAddr, "var_name", localVar, "new_name", "mixed_state"),
+                        Map.of("op", "rename_var", "function", "transform_fn", "var_name", localVar, "new_name", "mixed_state"),
+                        Map.of("op", "rename_global", "target", g0Addr, "new_name", "g_probe_state", "function", "transform_fn"),
                         Map.of("op", "set_comment", "target", transformAddr, "comment_type", "function", "text", "Transforms input via mix()"),
                         Map.of("op", "set_comment", "target", transformAddr, "comment_type", "pre", "text", "Entry pre-comment"))));
         assertEquals(2L, batch.get("version").getAsLong());
         String stepDiff = batch.getAsJsonArray("diffs").get(0).getAsJsonObject().get("diff").getAsString();
         assertTrue(stepDiff.contains("transform_fn"));
         assertTrue(stepDiff.contains("mixed_state"));
+        assertTrue(stepDiff.contains("g_probe_state"));
+
+        // Failed partial batch must roll back cleanly AND must NOT poison subsequent save_checkpoint
+        var failedBatch = rw.callRaw("apply_edits", Map.of(
+                "expected_version", 2,
+                "reason", "should roll back",
+                "edits", List.of(
+                        Map.of("op", "rename_var", "function", "transform_fn", "var_name", "mixed_state", "new_name", "leaked_var"),
+                        Map.of("op", "rename_var", "function", "transform_fn", "var_name", "nonexistent_var_xyz", "new_name", "nope"))));
+        assertTrue(failedBatch.isError());
+        assertEquals("VARIABLE_NOT_FOUND", failedBatch.body().getAsJsonObject("error").get("code").getAsString());
+        JsonObject afterFailedDec = rw.callOk("decompile", Map.of("target", transformAddr));
+        assertFalse(afterFailedDec.get("pseudocode").getAsString().contains("leaked_var"),
+                "Failed batch leaked var rename");
+        assertTrue(afterFailedDec.get("pseudocode").getAsString().contains("mixed_state"));
+
+        JsonObject chk = rw.callOk("save_checkpoint", Map.of("label", "after-transform"));
+        assertEquals(2L, chk.get("version").getAsLong());
+        JsonObject afterChkDec = rw.callOk("decompile", Map.of("target", transformAddr));
+        assertEquals("transform_fn", afterChkDec.getAsJsonObject("function").get("name").getAsString());
+        assertTrue(afterChkDec.get("pseudocode").getAsString().contains("mixed_state"),
+                "save_checkpoint after failed batch lost committed edits");
+
+        // set_signature should not trigger Unknown calling convention warning
+        JsonObject sigBatch = rw.callOk("apply_edits", Map.of(
+                "expected_version", 2,
+                "reason", "set transform signature",
+                "edits", List.of(
+                        Map.of("op", "set_signature", "target", "transform_fn",
+                                "signature", "uint32_t transform_fn(uint32_t a, uint32_t b)"))));
+        assertEquals(3L, sigBatch.get("version").getAsLong());
+        String sigDiff = sigBatch.getAsJsonArray("diffs").get(0).getAsJsonObject().get("diff").getAsString();
+        assertFalse(sigDiff.contains("Unknown calling convention"), "Unexpected warning in diff:\n" + sigDiff);
+        assertTrue(sigDiff.contains("uint32_t transform_fn("));
+
+        // Bare short type name ("ProbeState") rejected without allow_resize, accepted with allow_resize=true
+        var unsafeGlobal = rw.callRaw("apply_edits", Map.of(
+                "expected_version", 3,
+                "edits", List.of(Map.of("op", "set_global_type", "target", g0Addr, "type", "ProbeState"))));
+        assertTrue(unsafeGlobal.isError());
+        assertEquals("UNSAFE_GLOBAL_TYPE", unsafeGlobal.body().getAsJsonObject("error").get("code").getAsString());
+
+        JsonObject overlayBatch = rw.callOk("apply_edits", Map.of(
+                "expected_version", 3,
+                "reason", "overlay 8-byte ProbeState across adjacent globals",
+                "edits", List.of(Map.of(
+                        "op", "set_global_type",
+                        "target", g0Addr,
+                        "type", "ProbeState",
+                        "allow_resize", true))));
+        assertEquals(4L, overlayBatch.get("version").getAsLong());
+        JsonObject afterOverlayDec = rw.callOk("decompile", Map.of("target", transformAddr));
+        assertTrue(afterOverlayDec.getAsJsonArray("globals").toString().contains("ProbeState"),
+                "Expected ProbeState in transform globals: " + afterOverlayDec.getAsJsonArray("globals"));
+
+        // create_function + intra-batch set_signature on unrecovered main
+        JsonObject mainBatch = rw.callOk("apply_edits", Map.of(
+                "expected_version", 4,
+                "reason", "create and type recovered_main",
+                "edits", List.of(
+                        Map.of("op", "create_function", "target", mainAddr, "name", "recovered_main"),
+                        Map.of("op", "set_signature", "target", "recovered_main",
+                                "signature", "int recovered_main(int argc, char **argv)"))));
+        assertEquals(5L, mainBatch.get("version").getAsLong());
+        JsonObject mainDec = ro.callOk("decompile", Map.of("target", "recovered_main"));
+        assertEquals("complete", mainDec.get("decompile_status").getAsString());
+        assertTrue(mainDec.get("pseudocode").getAsString().contains("transform_fn"),
+                "Expected recovered_main to call transform_fn:\n" + mainDec.get("pseudocode").getAsString());
 
         // Stale expected_version fails without advancing version
         var stale = rw.callRaw("apply_edits", Map.of(
@@ -205,8 +295,8 @@ class HeadlessServerE2ETest {
         assertTrue(stale.isError());
         assertEquals("STALE_VERSION", stale.body().getAsJsonObject("error").get("code").getAsString());
 
-        JsonObject chk = rw.callOk("save_checkpoint", Map.of("label", "after-transform"));
-        assertEquals(2L, chk.get("version").getAsLong());
+        JsonObject chk2 = rw.callOk("save_checkpoint", Map.of("label", "after-main"));
+        assertEquals(5L, chk2.get("version").getAsLong());
 
         // 3. REST + CORS (for external wui/) + SSE checks
         HttpResponse<String> rootResp = get(baseUrl + "/");
@@ -217,15 +307,14 @@ class HeadlessServerE2ETest {
         assertEquals("*", statusResp.headers().firstValue("Access-Control-Allow-Origin").orElse(""));
 
         JsonObject versions = getJson(apiUrl + "/versions");
-        assertEquals(2L, versions.get("current_version").getAsLong());
-        assertEquals(3, versions.getAsJsonArray("versions").size());
-        JsonObject v2Summary = versions.getAsJsonArray("versions").get(2).getAsJsonObject();
-        assertFalse(v2Summary.has("before_c"));
-        assertEquals("after-transform", v2Summary.get("checkpoint_label").getAsString());
+        assertEquals(5L, versions.get("current_version").getAsLong());
+        assertEquals(6, versions.getAsJsonArray("versions").size());
+        JsonObject v5Summary = versions.getAsJsonArray("versions").get(5).getAsJsonObject();
+        assertFalse(v5Summary.has("before_c"));
+        assertEquals("after-main", v5Summary.get("checkpoint_label").getAsString());
 
-        JsonObject cumDiff = getJson(apiUrl + "/diff?from=0&to=2");
-        assertTrue(cumDiff.getAsJsonArray("diffs").get(0).getAsJsonObject()
-                .get("diff").getAsString().contains("+/* Transforms input via mix() */"));
+        JsonObject cumDiff = getJson(apiUrl + "/diff?from=0&to=5");
+        assertTrue(cumDiff.getAsJsonArray("diffs").toString().contains("Transforms input via mix()"));
 
         JsonObject fnDetail = getJson(apiUrl + "/functions/" + URLEncoder.encode(transformAddr, StandardCharsets.UTF_8));
         assertEquals("transform_fn", fnDetail.getAsJsonObject("function").get("name").getAsString());
@@ -242,23 +331,38 @@ class HeadlessServerE2ETest {
             assertNotNull(l1);
             assertNotNull(l2);
             assertTrue(l1.contains("event: status"), l1);
-            assertTrue(l2.contains("\"version\":2"), l2);
+            assertTrue(l2.contains("\"version\":5"), l2);
         }
 
-        // 4. Graceful shutdown -> restart on same work-dir -> cross-restart revert to v0
+        // 4. Graceful shutdown -> restart on same work-dir -> verify persistence -> full revert to v0
         srv1.shutdownAndAwait();
         assertFalse(Files.exists(tmpRoot.resolve("run-1/ready.json")));
 
         RunningServer srv2 = startServer("run-1", false);
-        assertEquals(2L, srv2.readyJson.get("current_version").getAsLong());
+        assertEquals(5L, srv2.readyJson.get("current_version").getAsLong());
         StreamableMcpClient rw2 = new StreamableMcpClient(srv2.baseUrl + "/mcp/rw", "main-rw-2");
+        JsonObject persistedTransform = rw2.callOk("decompile", Map.of("target", transformAddr));
+        assertEquals("transform_fn", persistedTransform.getAsJsonObject("function").get("name").getAsString());
+        assertTrue(persistedTransform.getAsJsonArray("globals").toString().contains("ProbeState"));
+        assertEquals("complete", rw2.callOk("decompile", Map.of("target", "recovered_main")).get("decompile_status").getAsString());
+
         JsonObject reverted = rw2.callOk("revert", Map.of(
-                "to_version", 0, "expected_version", 2, "reason", "full rollback test"));
-        assertEquals(3L, reverted.get("version").getAsLong());
+                "to_version", 0, "expected_version", 5, "reason", "full rollback test"));
+        assertEquals(6L, reverted.get("version").getAsLong());
 
         JsonObject afterDec = rw2.callOk("decompile", Map.of("target", transformAddr));
         assertFalse(afterDec.get("pseudocode").getAsString().contains("transform_fn"));
         assertFalse(afterDec.get("pseudocode").getAsString().contains("mixed_state"));
+        assertFalse(afterDec.getAsJsonArray("globals").toString().contains("ProbeState"),
+                "ProbeState global overlay was not reverted");
+        Set<String> restoredGlobalAddrs = new HashSet<>();
+        for (JsonElement el : afterDec.getAsJsonArray("globals")) {
+            restoredGlobalAddrs.add(el.getAsJsonObject().get("address").getAsString());
+        }
+        assertTrue(restoredGlobalAddrs.contains(g0Addr), "Missing restored global " + g0Addr);
+        assertTrue(restoredGlobalAddrs.contains(g1Addr), "Missing restored adjacent global " + g1Addr);
+        assertTrue(rw2.callRaw("decompile", Map.of("target", mainAddr)).isError(),
+                "recovered_main should be deleted on revert to v0");
         JsonObject afterTypes = rw2.callOk("get_type", Map.of("query", "ProbeState", "exact", true));
         assertEquals(0, afterTypes.get("total").getAsInt());
         srv2.shutdownAndAwait();
