@@ -16,11 +16,13 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.sql.DriverManager;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -74,6 +76,8 @@ class HeadlessServerE2ETest {
         Files.createDirectories(tmpRoot.resolve("cache"));
         Files.createDirectories(tmpRoot.resolve("input"));
         Files.copy(fixturePath, tmpRoot.resolve("input/readability-fixture.elf"));
+        Files.copy(artifactsDir.resolve("build/readability-fixture.unstripped.elf"),
+                tmpRoot.resolve("input/other-fixture.elf"));
     }
 
     @AfterAll
@@ -90,7 +94,7 @@ class HeadlessServerE2ETest {
 
     @Test
     void fullHeadlessLifecycleRoRwVersionsWebUiAndCache() throws Exception {
-        RunningServer srv1 = startServer("run-1", true);
+        RunningServer srv1 = startServer("run-1", true, "--cors-origin", "null");
         String baseUrl = srv1.baseUrl;
         String apiUrl = baseUrl + "/api/v1";
 
@@ -116,6 +120,12 @@ class HeadlessServerE2ETest {
         assertTrue(ro.callOk("list_symbols", Map.of("kind", "imports")).get("ok").getAsBoolean());
         assertTrue(ro.callOk("list_symbols", Map.of("kind", "strings")).get("ok").getAsBoolean());
         assertTrue(ro.callOk("list_symbols", Map.of("kind", "globals")).get("ok").getAsBoolean());
+        var imports = ro.callOk("list_symbols", Map.of("kind", "imports", "limit", 1));
+        String importCursor = imports.get("next_cursor").getAsString();
+        var filteredImports = ro.callOk("list_symbols", Map.of("kind", "imports", "cursor", importCursor,
+                "filter", "no_matching_import_in_the_fixture"));
+        assertTrue(filteredImports.getAsJsonArray("items").isEmpty());
+        assertFalse(filteredImports.has("next_cursor"));
 
         // Find mix() via 0x7feb352d constant in pseudocode, then caller transform()
         JsonObject searchPseudo = ro.callOk("search_code", Map.of("query", "7feb352d", "scope", "pseudocode"));
@@ -133,6 +143,9 @@ class HeadlessServerE2ETest {
             }
         }
         assertNotNull(transformAddr, "Expected caller for mix");
+        String endCursor = ApiError.encodeCursor(GSON, Map.of("offset", Integer.MAX_VALUE));
+        assertTrue(ro.callOk("get_xrefs", Map.of("target", mixAddr, "cursor", endCursor))
+                .getAsJsonArray("xrefs").isEmpty());
 
         JsonObject dec = ro.callOk("decompile", Map.of("target", transformAddr));
         assertEquals("complete", dec.get("decompile_status").getAsString());
@@ -298,13 +311,23 @@ class HeadlessServerE2ETest {
         JsonObject chk2 = rw.callOk("save_checkpoint", Map.of("label", "after-main"));
         assertEquals(5L, chk2.get("version").getAsLong());
 
+        var internal = rw.callRaw("apply_edits", Map.of("expected_version", 5, "edits",
+                List.of(Map.of("op", "remove_type", "path", "/mcp/ProbeState"))));
+        assertTrue(internal.isError());
+        assertEquals("INVALID_ARGUMENT", internal.body().getAsJsonObject("error").get("code").getAsString());
+
         // 3. REST + CORS (for external wui/) + SSE checks
         HttpResponse<String> rootResp = get(baseUrl + "/");
         assertEquals(404, rootResp.statusCode());
 
         HttpResponse<String> statusResp = get(apiUrl + "/status");
         assertEquals(200, statusResp.statusCode());
-        assertEquals("*", statusResp.headers().firstValue("Access-Control-Allow-Origin").orElse(""));
+        assertTrue(statusResp.headers().firstValue("Access-Control-Allow-Origin").isEmpty());
+        assertEquals(404, get(baseUrl + "/viewer").statusCode());
+        var standaloneStatus = HttpRequest.newBuilder(URI.create(apiUrl + "/status")).header("Origin", "null").build();
+        var standaloneResponse = HTTP.send(standaloneStatus, HttpResponse.BodyHandlers.discarding());
+        assertEquals(200, standaloneResponse.statusCode());
+        assertEquals("null", standaloneResponse.headers().firstValue("Access-Control-Allow-Origin").orElseThrow());
 
         JsonObject versions = getJson(apiUrl + "/versions");
         assertEquals(5L, versions.get("current_version").getAsLong());
@@ -365,6 +388,9 @@ class HeadlessServerE2ETest {
                 "recovered_main should be deleted on revert to v0");
         JsonObject afterTypes = rw2.callOk("get_type", Map.of("query", "ProbeState", "exact", true));
         assertEquals(0, afterTypes.get("total").getAsInt());
+        var incomplete = rw2.callRaw("revert", Map.of("to_version", 5, "expected_version", 6));
+        assertTrue(incomplete.isError());
+        assertEquals("REVERT_UNAVAILABLE", incomplete.body().getAsJsonObject("error").get("code").getAsString());
         srv2.shutdownAndAwait();
 
         // 5. Cache hit on fresh run-2
@@ -376,7 +402,137 @@ class HeadlessServerE2ETest {
         srv3.shutdownAndAwait();
     }
 
-    private static RunningServer startServer(String runName, boolean withBinary) throws Exception {
+    @Test
+    void accessPolicyAndAcknowledgedEditsSurviveAnAbruptExit() throws Exception {
+        String[] access = {"--rw-token", "e2e-write", "--ro-token", "e2e-read",
+                "--cors-origin", "http://localhost:9876"};
+        RunningServer server = startServer("durability", true, access);
+        String base = server.baseUrl;
+        String api = base + "/api/v1";
+        assertEquals(200, get(api + "/health").statusCode());
+        for (String path : List.of("/api/v1/status", "/api/v1/functions", "/api/v1/versions",
+                "/api/v1/diff", "/api/v1/events", "/mcp/ro", "/mcp/rw")) {
+            assertEquals(401, get(base + path).statusCode(), path);
+        }
+
+        var allowed = HttpRequest.newBuilder(URI.create(api + "/status"))
+                .header("Authorization", "Bearer e2e-read")
+                .header("Origin", "http://localhost:9876").build();
+        var allowedResponse = HTTP.send(allowed, HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, allowedResponse.statusCode());
+        assertEquals("http://localhost:9876",
+                allowedResponse.headers().firstValue("Access-Control-Allow-Origin").orElseThrow());
+        var otherOrigin = HttpRequest.newBuilder(URI.create(api + "/status"))
+                .header("Authorization", "Bearer e2e-read")
+                .header("Origin", "http://localhost:9875").build();
+        assertEquals(403, HTTP.send(otherOrigin, HttpResponse.BodyHandlers.discarding()).statusCode());
+
+        for (String route : List.of("/api/v1/events", "/mcp/ro", "/mcp/rw")) {
+            var preflight = HttpRequest.newBuilder(URI.create(base + route))
+                    .header("Origin", "http://localhost:9876")
+                    .header("Access-Control-Request-Method", "POST")
+                    .header("Access-Control-Request-Headers", "Authorization, Mcp-Session-Id")
+                    .method("OPTIONS", HttpRequest.BodyPublishers.noBody()).build();
+            var response = HTTP.send(preflight, HttpResponse.BodyHandlers.discarding());
+            assertEquals(204, response.statusCode(), route);
+            assertTrue(response.headers().firstValue("Access-Control-Allow-Headers").orElseThrow()
+                    .contains("Mcp-Session-Id"), route);
+        }
+
+        var shutdown = HttpRequest.newBuilder(URI.create(api + "/shutdown"))
+                .header("Authorization", "Bearer e2e-read")
+                .POST(HttpRequest.BodyPublishers.noBody()).build();
+        assertEquals(401, HTTP.send(shutdown, HttpResponse.BodyHandlers.discarding()).statusCode());
+
+        StreamableMcpClient ro = new StreamableMcpClient(base + "/mcp/ro", "secured-ro", "e2e-read");
+        StreamableMcpClient rw = new StreamableMcpClient(base + "/mcp/rw", "secured-rw", "e2e-write");
+        var eventRequest = HttpRequest.newBuilder(URI.create(api + "/events"))
+                .timeout(Duration.ofSeconds(10)).header("Authorization", "Bearer e2e-read").build();
+        var events = HTTP.send(eventRequest, HttpResponse.BodyHandlers.ofInputStream());
+        assertEquals(200, events.statusCode());
+        try (var reader = new BufferedReader(new InputStreamReader(events.body(), StandardCharsets.UTF_8))) {
+            rw.callOk("define_type", Map.of("expected_version", 0,
+                    "c_declaration", "enum AuditEnum { FIRST = 0, ALIAS = 0, LAST = 2 }; "
+                            + "typedef struct AuditRecord { int value; } AuditRecordAlias;"));
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+                assertEquals("event: status", reader.readLine());
+                assertTrue(reader.readLine().startsWith("data: "));
+                assertEquals("", reader.readLine());
+                assertEquals("event: version_created", reader.readLine());
+            });
+        }
+
+        var duplicate = rw.callRaw("define_type", Map.of("expected_version", 1,
+                "c_declaration", "enum AuditEnum { REPLACEMENT = 5 };"));
+        assertTrue(duplicate.isError());
+        assertEquals("TYPE_EXISTS", duplicate.body().getAsJsonObject("error").get("code").getAsString());
+
+        String db = "jdbc:sqlite:" + tmpRoot.resolve("durability/history.sqlite");
+        try (var conn = DriverManager.getConnection(db); var st = conn.createStatement()) {
+            st.execute("CREATE TRIGGER fail_edit BEFORE INSERT ON versions "
+                    + "BEGIN SELECT RAISE(ABORT, 'injected history failure'); END;");
+            var failed = rw.callRaw("define_type", Map.of("expected_version", 1,
+                    "c_declaration", "struct Unrecorded { int a; };"));
+            assertTrue(failed.isError());
+            assertEquals(1, ro.callOk("program_info", Map.of()).get("version").getAsInt());
+            assertEquals(0, ro.callOk("get_type", Map.of("query", "Unrecorded")).get("total").getAsInt());
+            st.execute("DROP TRIGGER fail_edit");
+        }
+
+        server.forceStop();
+        assertTrue(server.proc.waitFor(20, TimeUnit.SECONDS), "Server did not terminate");
+        String otherPath = "local".equalsIgnoreCase(MODE)
+                ? tmpRoot.resolve("input/other-fixture.elf").toString() : "/data/input/other-fixture.elf";
+        AssertionError mismatch = assertThrows(AssertionError.class,
+                () -> startServer("durability", false, "--binary", otherPath));
+        assertTrue(mismatch.getMessage().contains("Binary does not match the saved workspace"), mismatch.getMessage());
+
+        RunningServer reopened = startServer("durability", false);
+        assertEquals(1, reopened.readyJson.get("current_version").getAsInt());
+        var resumed = new StreamableMcpClient(reopened.baseUrl + "/mcp/ro", "resumed");
+        var types = resumed.callOk("get_type", Map.of("query", "AuditEnum", "exact", true)).getAsJsonArray("types");
+        var values = types.get(0).getAsJsonObject().getAsJsonArray("values");
+        Map<String, Integer> byName = new HashMap<>();
+        for (var value : values) {
+            var entry = value.getAsJsonObject();
+            byName.put(entry.get("name").getAsString(), entry.get("value").getAsInt());
+        }
+        assertEquals(Map.of("FIRST", 0, "ALIAS", 0, "LAST", 2), byName);
+        var typedef = resumed.callOk("get_type", Map.of("query", "/mcp/AuditRecordAlias", "exact", true))
+                .getAsJsonArray("types").get(0).getAsJsonObject();
+        assertEquals("typedef", typedef.get("kind").getAsString());
+        assertEquals("/mcp/AuditRecord", typedef.get("base_path").getAsString());
+        var records = resumed.callOk("get_type", Map.of("query", "AuditRecord", "exact", true))
+                .getAsJsonArray("types");
+        assertEquals(1, records.size());
+        assertEquals("value", records.get(0).getAsJsonObject().getAsJsonArray("fields")
+                .get(0).getAsJsonObject().get("name").getAsString());
+
+        var resumedWriter = new StreamableMcpClient(reopened.baseUrl + "/mcp/rw", "resumed-rw");
+        try (var conn = DriverManager.getConnection(db); var st = conn.createStatement()) {
+            st.execute("CREATE TRIGGER fail_publication BEFORE DELETE ON meta "
+                    + "WHEN OLD.key = 'pending_version' BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;");
+            var interrupted = resumedWriter.callRaw("define_type", Map.of("expected_version", 1,
+                    "c_declaration", "struct SavedPending { int a; };"));
+            assertTrue(interrupted.isError());
+            assertEquals("RECOVERY_REQUIRED", interrupted.body().getAsJsonObject("error").get("code").getAsString());
+            var health = get(reopened.baseUrl + "/api/v1/health");
+            assertEquals(503, health.statusCode());
+            assertEquals("recovery_required", JsonParser.parseString(health.body()).getAsJsonObject().get("status").getAsString());
+            assertEquals(503, get(reopened.baseUrl + "/api/v1/status").statusCode());
+            assertEquals(503, get(reopened.baseUrl + "/api/v1/versions").statusCode());
+            st.execute("DROP TRIGGER fail_publication");
+        }
+        reopened.shutdownAndAwait();
+        RunningServer recovered = startServer("durability", false);
+        assertEquals(2, recovered.readyJson.get("current_version").getAsInt());
+        var recoveredReader = new StreamableMcpClient(recovered.baseUrl + "/mcp/ro", "recovered-ro");
+        assertEquals(1, recoveredReader.callOk("get_type", Map.of("query", "SavedPending", "exact", true))
+                .get("total").getAsInt());
+        recovered.shutdownAndAwait();
+    }
+
+    private static RunningServer startServer(String runName, boolean withBinary, String... options) throws Exception {
         Path workDir = tmpRoot.resolve(runName);
         Files.createDirectories(workDir);
         Path readyFile = workDir.resolve("ready.json");
@@ -392,6 +548,7 @@ class HeadlessServerE2ETest {
                 cmd.add("--binary");
                 cmd.add(fixturePath.toString());
             }
+            cmd.addAll(List.of(options));
             Process proc = new ProcessBuilder(cmd).directory(repoDir.toFile()).start();
             RunningServer srv = new RunningServer(proc, null, null, readyFile);
             STARTED.add(srv);
@@ -411,6 +568,7 @@ class HeadlessServerE2ETest {
             cmd.add("--binary");
             cmd.add("/data/input/readability-fixture.elf");
         }
+        cmd.addAll(List.of(options));
         Process proc = new ProcessBuilder(cmd).start();
         RunningServer srv = new RunningServer(proc, ENGINE, cname, readyFile);
         STARTED.add(srv);
@@ -511,12 +669,18 @@ class HeadlessServerE2ETest {
     private static final class StreamableMcpClient {
         private final String url;
         private final String name;
+        private final String token;
         private String sessionId;
         private int nextId = 1;
 
         StreamableMcpClient(String url, String name) throws Exception {
+            this(url, name, null);
+        }
+
+        StreamableMcpClient(String url, String name, String token) throws Exception {
             this.url = url;
             this.name = name;
+            this.token = token;
             JsonObject res = request("initialize", Map.of(
                     "protocolVersion", "2025-03-26",
                     "capabilities", Map.of(),
@@ -562,6 +726,7 @@ class HeadlessServerE2ETest {
                     .header("Accept", "application/json, text/event-stream")
                     .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(payload), StandardCharsets.UTF_8));
             if (sessionId != null) b.header("Mcp-Session-Id", sessionId);
+            if (token != null) b.header("Authorization", "Bearer " + token);
             HttpResponse<String> resp = HTTP.send(b.build(), HttpResponse.BodyHandlers.ofString());
             resp.headers().firstValue("Mcp-Session-Id").ifPresent(sid -> sessionId = sid);
             String raw = resp.body();

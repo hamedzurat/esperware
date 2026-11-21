@@ -2,41 +2,43 @@ package org.esperware.ghidramcp;
 
 import com.google.gson.Gson;
 import jakarta.servlet.AsyncContext;
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.io.PrintWriter;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 /** Simple REST + SSE API on /api/v1/* for external WebUI clients. */
 final class WebApiServlet extends HttpServlet {
     record ReadyContext(
-            ProgramWorkspace workspace,
             VersionStore store,
             InspectService inspect,
             String mcpRwUrl,
             String mcpRoUrl,
-            Runnable shutdownTrigger) {}
+            Runnable shutdownTrigger,
+            BooleanSupplier recoveryRequired) {}
 
     private final Gson gson = new Gson();
-    private final String corsOrigin;
     private final long startedAtMs = System.currentTimeMillis();
     private final AtomicReference<String> phase = new AtomicReference<>("analyzing");
     private final AtomicReference<String> errorMsg = new AtomicReference<>();
     private final AtomicReference<ReadyContext> ctxRef = new AtomicReference<>();
-    private final Set<AsyncContext> activeSse = ConcurrentHashMap.newKeySet();
-
-    WebApiServlet(String corsOrigin) {
-        this.corsOrigin = (corsOrigin == null || corsOrigin.isBlank()) ? "*" : corsOrigin;
-    }
+    private final Set<Thread> activeSse = ConcurrentHashMap.newKeySet();
+    private final Semaphore eventSlots = new Semaphore(16);
+    private boolean eventStreamsClosed;
 
     void markReady(ReadyContext ctx) {
         ctxRef.set(ctx);
@@ -49,26 +51,19 @@ final class WebApiServlet extends HttpServlet {
     }
 
     @Override
-    protected void doOptions(HttpServletRequest req, HttpServletResponse resp) {
-        addCors(resp);
-        resp.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        resp.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-        resp.setStatus(204);
-    }
-
-    @Override
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
-        addCors(resp);
         String path = req.getRequestURI();
         if (path == null) path = "/";
 
         if ("/api/v1/health".equals(path)) {
-            String st = phase.get();
+            ReadyContext ctx = ctxRef.get();
+            String st = ctx != null && ctx.recoveryRequired().getAsBoolean() ? "recovery_required" : phase.get();
+            boolean ok = !"error".equals(st) && !"recovery_required".equals(st);
             Map<String, Object> body = new LinkedHashMap<>();
-            body.put("ok", !"error".equals(st));
+            body.put("ok", ok);
             body.put("status", st);
             if (errorMsg.get() != null) body.put("error", errorMsg.get());
-            sendJson(resp, "error".equals(st) ? 503 : 200, body);
+            sendJson(resp, ok ? 200 : 503, body);
             return;
         }
 
@@ -84,6 +79,9 @@ final class WebApiServlet extends HttpServlet {
         }
 
         try {
+            if (ctx.recoveryRequired().getAsBoolean()) {
+                throw new ApiError("RECOVERY_REQUIRED", "Restart the server to recover the workspace", null);
+            }
             if ("/api/v1/status".equals(path)) {
                 Map<String, Object> status = new LinkedHashMap<>(ctx.inspect().programInfo());
                 status.put("state", phase.get());
@@ -92,10 +90,11 @@ final class WebApiServlet extends HttpServlet {
                 status.put("uptime_ms", System.currentTimeMillis() - startedAtMs);
                 sendJson(resp, 200, status);
             } else if ("/api/v1/versions".equals(path)) {
+                var versions = ctx.store().listVersions();
                 sendJson(resp, 200, Map.of(
                         "ok", true,
-                        "current_version", ctx.store().currentVersion(),
-                        "versions", ctx.store().listVersions()));
+                        "current_version", versions.getLast().get("version"),
+                        "versions", versions));
             } else if (path.startsWith("/api/v1/versions/")) {
                 long v = Long.parseLong(path.substring("/api/v1/versions/".length()));
                 Map<String, Object> detail = ctx.store().getVersion(v);
@@ -132,7 +131,7 @@ final class WebApiServlet extends HttpServlet {
         } catch (NumberFormatException e) {
             sendJson(resp, 400, Map.of("ok", false, "error", "Invalid numeric parameter"));
         } catch (ApiError e) {
-            int code = e.code.contains("NOT_FOUND") ? 404 : 400;
+            int code = "RECOVERY_REQUIRED".equals(e.code) ? 503 : e.code.contains("NOT_FOUND") ? 404 : 400;
             sendJson(resp, code, Map.of("ok", false, "code", e.code, "error", e.getMessage()));
         } catch (Exception e) {
             sendJson(resp, 500, Map.of("ok", false, "error", e.getMessage() == null ? "internal error" : e.getMessage()));
@@ -141,7 +140,6 @@ final class WebApiServlet extends HttpServlet {
 
     @Override
     protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws IOException {
-        addCors(resp);
         if ("/api/v1/shutdown".equals(req.getRequestURI())) {
             ReadyContext ctx = ctxRef.get();
             sendJson(resp, 202, Map.of("ok", true, "shutting_down", true));
@@ -154,53 +152,79 @@ final class WebApiServlet extends HttpServlet {
         sendJson(resp, 404, Map.of("ok", false, "error", "Not found"));
     }
 
-    private void handleSse(HttpServletRequest req, HttpServletResponse resp, VersionStore store) throws IOException {
-        resp.setStatus(200);
+    private synchronized void handleSse(HttpServletRequest req, HttpServletResponse resp, VersionStore store)
+            throws IOException {
+        if (eventStreamsClosed || !eventSlots.tryAcquire()) {
+            resp.sendError(503, "Too many event streams");
+            return;
+        }
         resp.setContentType("text/event-stream; charset=utf-8");
         resp.setHeader("Cache-Control", "no-store");
-        resp.setHeader("Connection", "keep-alive");
-        resp.flushBuffer();
 
-        AsyncContext async = req.startAsync();
-        async.setTimeout(0);
-        activeSse.add(async);
-        PrintWriter writer = resp.getWriter();
-        writer.write("event: status\ndata: " + gson.toJson(Map.of(
-                "state", phase.get(), "version", store.currentVersion())) + "\n\n");
-        writer.flush();
+        AsyncContext async;
+        try {
+            async = req.startAsync();
+            async.setTimeout(0);
+        } catch (RuntimeException e) {
+            eventSlots.release();
+            throw e;
+        }
+        var disconnected = new AtomicBoolean();
+        Thread worker = Thread.ofVirtual().unstarted(() -> streamEvents(async, store, disconnected));
+        async.addListener(new AsyncListener() {
+            @Override public void onComplete(AsyncEvent e) { disconnect(); }
+            @Override public void onError(AsyncEvent e) { disconnect(); }
+            @Override public void onTimeout(AsyncEvent e) { disconnect(); }
+            @Override public void onStartAsync(AsyncEvent e) {}
 
-        Object writeLock = new Object();
-        AutoCloseable[] subHolder = new AutoCloseable[1];
-        subHolder[0] = store.subscribe(evt -> {
-            synchronized (writeLock) {
-                if (writer.checkError()) {
-                    closeQuietly(subHolder[0]);
-                    activeSse.remove(async);
-                    try { async.complete(); } catch (Exception ignored) {}
-                    return;
-                }
-                writer.write("event: " + evt.type() + "\ndata: " + gson.toJson(evt.data()) + "\n\n");
-                writer.flush();
+            private void disconnect() {
+                disconnected.set(true);
+                worker.interrupt();
             }
         });
-
-        async.addListener(new jakarta.servlet.AsyncListener() {
-            @Override public void onComplete(jakarta.servlet.AsyncEvent e) { activeSse.remove(async); closeQuietly(subHolder[0]); }
-            @Override public void onTimeout(jakarta.servlet.AsyncEvent e) { activeSse.remove(async); closeQuietly(subHolder[0]); async.complete(); }
-            @Override public void onError(jakarta.servlet.AsyncEvent e) { activeSse.remove(async); closeQuietly(subHolder[0]); }
-            @Override public void onStartAsync(jakarta.servlet.AsyncEvent e) {}
-        });
+        activeSse.add(worker);
+        worker.start();
     }
 
-    void closeSse() {
-        for (AsyncContext async : List.copyOf(activeSse)) {
-            activeSse.remove(async);
-            try { async.complete(); } catch (Exception ignored) {}
+    private void streamEvents(AsyncContext async, VersionStore store, AtomicBoolean disconnected) {
+        Thread worker = Thread.currentThread();
+        var events = new ArrayBlockingQueue<VersionStore.SseEvent>(16);
+        try (var subscription = store.subscribe(event -> {
+            if (!events.offer(event)) worker.interrupt();
+        })) {
+            if (disconnected.get() || worker.isInterrupted()) return;
+            var out = async.getResponse().getOutputStream();
+            writeEvent(out, new VersionStore.SseEvent("status", Map.of(
+                    "state", phase.get(), "version", store.currentVersion())));
+            while (!disconnected.get() && !worker.isInterrupted()) {
+                var event = events.poll(5, TimeUnit.SECONDS);
+                if (event == null) {
+                    out.write(": keepalive\n\n".getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                } else {
+                    writeEvent(out, event);
+                }
+            }
+        } catch (IOException | InterruptedException ignored) {
+            // The client disconnected or its queue filled up.
+        } catch (Exception e) {
+            getServletContext().log("Event stream failed", e);
+        } finally {
+            activeSse.remove(worker);
+            eventSlots.release();
+            try { async.complete(); } catch (IllegalStateException ignored) {}
         }
     }
 
-    private void addCors(HttpServletResponse resp) {
-        resp.setHeader("Access-Control-Allow-Origin", corsOrigin);
+    private void writeEvent(jakarta.servlet.ServletOutputStream out, VersionStore.SseEvent event) throws IOException {
+        String message = "event: " + event.type() + "\ndata: " + gson.toJson(event.data()) + "\n\n";
+        out.write(message.getBytes(StandardCharsets.UTF_8));
+        out.flush();
+    }
+
+    synchronized void closeSse() {
+        eventStreamsClosed = true;
+        activeSse.forEach(Thread::interrupt);
     }
 
     private void sendJson(HttpServletResponse resp, int status, Object body) throws IOException {
@@ -217,7 +241,4 @@ final class WebApiServlet extends HttpServlet {
         return (raw == null || raw.isBlank()) ? def : Long.parseLong(raw.trim());
     }
 
-    private static void closeQuietly(AutoCloseable c) {
-        if (c != null) try { c.close(); } catch (Exception ignored) {}
-    }
 }

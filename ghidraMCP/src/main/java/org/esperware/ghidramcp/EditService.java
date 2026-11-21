@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -58,6 +59,32 @@ final class EditService {
     private static final int MAX_AUTO_GLOBAL_REFS = 10;
     private static final Pattern SIG_NAME_PATTERN = Pattern.compile("^(.*?)\\b([A-Za-z_][A-Za-z0-9_]*)$");
 
+    private static final class AddTypesOnly extends DataTypeConflictHandler {
+        private final Set<String> existingPaths;
+
+        AddTypesOnly(Set<String> existingPaths) {
+            this.existingPaths = existingPaths;
+        }
+
+        @Override
+        public ConflictResult resolveConflict(DataType added, DataType existing) {
+            if (existingPaths.contains(existing.getPathName())) {
+                throw new ApiError("TYPE_EXISTS", "Type already exists: " + existing.getPathName(), null);
+            }
+            return ConflictResult.USE_EXISTING;
+        }
+
+        @Override
+        public boolean shouldUpdate(DataType source, DataType existing) {
+            return false;
+        }
+
+        @Override
+        public DataTypeConflictHandler getSubsequentHandler() {
+            return this;
+        }
+    }
+
     private final ProgramWorkspace ws;
     private final VersionStore store;
 
@@ -71,6 +98,12 @@ final class EditService {
         long expected = ApiError.reqLong(args, "expected_version", store.currentVersion());
         String reason = ApiError.optStr(args, "reason");
         List<Map<String, Object>> edits = ApiError.reqMapList(args, "edits", MAX_BATCH_OPS);
+        for (Map<String, Object> op : edits) {
+            String kind = ApiError.reqStr(op, "op");
+            if (List.of("remove_type", "delete_function", "clear_data").contains(kind)) {
+                throw new ApiError("INVALID_ARGUMENT", "Unsupported edit op: " + kind, null);
+            }
+        }
 
         return ws.withWriteLock(() -> {
             long current = store.currentVersion();
@@ -121,27 +154,46 @@ final class EditService {
                     throw new ApiError("INVALID_TYPE_DECLARATION", "No data type found in c_declaration", current);
                 }
 
+                CategoryPath cat = new CategoryPath(categoryPath);
+                try (var tx = tempDtm.openTransaction("Set declaration category")) {
+                    for (DataType dt : parsedTypes) {
+                        if (dt.getDataTypeManager() == tempDtm) dt.setCategoryPath(cat);
+                    }
+                }
                 List<Map<String, Object>> defined = new ArrayList<>();
                 List<Map<String, Object>> inverseOps = new ArrayList<>();
-                CategoryPath cat = new CategoryPath(categoryPath);
                 try {
-                    ws.runInTransaction(() -> {
+                    return ws.runEdit(() -> {
+                        Set<String> existingPaths = new HashSet<>();
+                        targetDtm.getAllDataTypes().forEachRemaining(dt -> existingPaths.add(dt.getPathName()));
+                        var conflicts = new AddTypesOnly(existingPaths);
                         for (DataType dt : parsedTypes) {
-                            DataType copy = dt.copy(targetDtm);
-                            copy.setCategoryPath(cat);
-                            String destPath = new CategoryPath(cat, copy.getName()).getPath();
-                            boolean existedBefore = targetDtm.getDataType(destPath) != null;
-                            DataType resolved = targetDtm.resolve(copy, DataTypeConflictHandler.REPLACE_HANDLER);
+                            DataType candidate = dt;
+                            if (dt.getDataTypeManager() != tempDtm) {
+                                candidate = dt.copy(targetDtm);
+                                candidate.setCategoryPath(cat);
+                            }
+                            String destPath = candidate.getPathName();
+                            if (existingPaths.contains(destPath)) {
+                                throw new ApiError("TYPE_EXISTS", "Type already exists: " + destPath, current);
+                            }
+                            DataType resolved = targetDtm.resolve(candidate, conflicts);
                             defined.add(Map.of(
                                     "name", resolved.getName(),
                                     "path", resolved.getPathName(),
                                     "size", resolved.getLength()));
-                            if (!existedBefore) {
-                                // shortcut: define_type revert removes newly created types; restoring overwritten composite fields requires .gpr checkpoint.
-                                inverseOps.add(Map.of("op", "remove_type", "path", resolved.getPathName()));
-                            }
                         }
-                        return null;
+                        targetDtm.getAllDataTypes().forEachRemaining(dt -> {
+                            if (!existingPaths.contains(dt.getPathName())) {
+                                inverseOps.add(Map.of("op", "remove_type", "path", dt.getPathName()));
+                            }
+                        });
+                        Collections.reverse(inverseOps);
+                        ws.invalidateCache();
+                        long newVer = persistVersion(actor, "define_type", reason,
+                                List.of(Map.of("op", "define_type", "category", categoryPath, "c_declaration", cDecl)),
+                                inverseOps, List.of());
+                        return Map.of("ok", true, "version", newVer, "previous_version", current, "defined_types", defined);
                     });
                 } catch (ApiError err) {
                     throw new ApiError(err.code, err.getMessage(), current);
@@ -149,12 +201,6 @@ final class EditService {
                     throw new ApiError("EDIT_FAILED",
                             ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(), current);
                 }
-                ws.invalidateCache();
-                Collections.reverse(inverseOps);
-                long newVer = store.recordVersion(actor, "define_type", reason,
-                        List.of(Map.of("op", "define_type", "category", categoryPath, "c_declaration", cDecl)),
-                        inverseOps, List.of());
-                return Map.of("ok", true, "version", newVer, "previous_version", current, "defined_types", defined);
             }
         });
     }
@@ -190,7 +236,6 @@ final class EditService {
         requireWrite(mode);
         String label = ApiError.optStr(args, "label");
         return ws.withWriteLock(() -> {
-            ws.save();
             long ver = store.currentVersion();
             store.tagCheckpoint(ver, label);
             Map<String, Object> out = new LinkedHashMap<>();
@@ -207,34 +252,37 @@ final class EditService {
             String actor,
             String reason,
             List<Map<String, Object>> ops) throws Exception {
-        Program p = ws.program();
         long current = store.currentVersion();
-
-        PreResolution pre;
-        Map<String, String> beforeCode = new LinkedHashMap<>();
-        List<List<Map<String, Object>>> perOpInverses = new ArrayList<>();
         try {
-            pre = preResolveTouchedFunctions(ops);
-            for (Map.Entry<String, Function> e : pre.touchedFunctions.entrySet()) {
-                var d = ws.decompileCached(e.getValue(), DECOMPILE_TIMEOUT_SEC);
-                beforeCode.put(e.getKey(), "complete".equals(d.status()) ? d.code() : null);
-            }
-
-            Map<String, HighFunction> liveHfCache = new HashMap<>();
-            Map<String, Map<String, String>> varRenameAliases = new HashMap<>();
-
-            ws.runInTransaction(() -> {
-                for (Map<String, Object> op : ops) {
-                    List<Map<String, Object>> inv = applyOp(op, liveHfCache, varRenameAliases);
-                    if (inv != null && !inv.isEmpty()) perOpInverses.add(inv);
-                }
-                return null;
-            });
+            return ws.runEdit(() -> applyAndRecordBatch(operation, actor, reason, ops, current));
         } catch (ApiError err) {
             throw new ApiError(err.code, err.getMessage(), current);
         } catch (Exception ex) {
             throw new ApiError("EDIT_FAILED",
                     ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(), current);
+        }
+    }
+
+    private Map<String, Object> applyAndRecordBatch(
+            String operation, String actor, String reason, List<Map<String, Object>> ops, long current)
+            throws Exception {
+        Program p = ws.program();
+        PreResolution pre = preResolveTouchedFunctions(ops);
+        Map<String, String> beforeCode = new LinkedHashMap<>();
+        Map<String, String> beforeNames = new HashMap<>();
+        for (Map.Entry<String, Function> e : pre.touchedFunctions.entrySet()) {
+            beforeNames.put(e.getKey(), e.getValue().getName());
+            var d = ws.decompileCached(e.getValue(), DECOMPILE_TIMEOUT_SEC);
+            beforeCode.put(e.getKey(), "complete".equals(d.status()) ? d.code() : null);
+        }
+
+        Map<String, HighFunction> liveHfCache = new HashMap<>();
+        Map<String, Map<String, String>> varRenameAliases = new HashMap<>();
+        List<List<Map<String, Object>>> perOpInverses = new ArrayList<>();
+        for (Map<String, Object> op : ops) {
+            List<Map<String, Object>> inv = applyOp(op, liveHfCache, varRenameAliases);
+            if (inv != null && !inv.isEmpty()) perOpInverses.add(inv);
+            if ("revert".equals(operation)) varRenameAliases.clear();
         }
 
         ws.invalidateCache();
@@ -251,13 +299,12 @@ final class EditService {
         List<Map<String, Object>> apiDiffs = new ArrayList<>();
         for (Map.Entry<String, Function> e : pre.touchedFunctions.entrySet()) {
             String addr = e.getKey();
-            Function beforeFn = e.getValue();
             Address entryAddr = ws.parseAddress(addr);
             Function liveFn = entryAddr == null ? null : p.getFunctionManager().getFunctionAt(entryAddr);
             String before = beforeCode.get(addr);
 
             if (liveFn == null) {
-                String delName = beforeFn.getName();
+                String delName = beforeNames.get(addr);
                 String diff = before != null ? ApiError.unifiedDiff(delName + " @ " + addr, before, "") : "";
                 storedDiffs.add(new VersionStore.FunctionDiff(addr, delName, before, "", diff, "deleted"));
 
@@ -294,7 +341,7 @@ final class EditService {
         for (List<Map<String, Object>> group : perOpInverses) {
             inverseOps.addAll(group);
         }
-        long newVersion = store.recordVersion(actor, operation, reason, ops, inverseOps, storedDiffs);
+        long newVersion = persistVersion(actor, operation, reason, ops, inverseOps, storedDiffs);
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("ok", true);
@@ -302,6 +349,15 @@ final class EditService {
         out.put("previous_version", current);
         out.put("diffs", apiDiffs);
         return out;
+    }
+
+    private long persistVersion(String actor, String operation, String reason, List<Map<String, Object>> ops,
+                                List<Map<String, Object>> inverseOps, List<VersionStore.FunctionDiff> diffs)
+            throws Exception {
+        ws.checkEditTransaction();
+        long version = store.recordVersion(actor, operation, reason, ops, inverseOps, diffs, ws::saveVersion);
+        ws.versionPublished();
+        return version;
     }
 
     private PreResolution preResolveTouchedFunctions(List<Map<String, Object>> ops) {
@@ -505,8 +561,10 @@ final class EditService {
                 VarHandle vh = resolveVar(fn, effectiveName, liveHfCache);
                 String oldName = vh.name();
                 vh.rename(newName);
-                varRenameAliases.computeIfAbsent(fnAddr, k -> new HashMap<>()).put(requestedName, newName);
-                varRenameAliases.get(fnAddr).put(newName, newName);
+                var aliases = varRenameAliases.computeIfAbsent(fnAddr, k -> new HashMap<>());
+                aliases.replaceAll((alias, name) -> name.equals(oldName) ? newName : name);
+                aliases.put(oldName, newName);
+                aliases.put(newName, newName);
                 liveHfCache.remove(fnAddr);
                 yield List.of(Map.of("op", "rename_var", "function", fnAddr, "var_name", newName, "new_name", oldName));
             }
@@ -533,7 +591,9 @@ final class EditService {
             case "remove_type" -> {
                 String path = ApiError.reqStr(op, "path");
                 DataType dt = p.getDataTypeManager().getDataType(path);
-                if (dt != null) p.getDataTypeManager().remove(dt);
+                if (dt != null && !p.getDataTypeManager().remove(dt)) {
+                    throw new ApiError("EDIT_FAILED", "Could not remove type " + path, null);
+                }
                 yield List.of();
             }
             default -> throw new ApiError("INVALID_ARGUMENT", "Unsupported edit op: " + kind, null);
@@ -592,9 +652,6 @@ final class EditService {
 
         Data existingAtStart = p.getListing().getDefinedDataAt(addr);
         boolean allowResize = ApiError.optBool(op, "allow_resize", false);
-        if (!allowResize && op.get("allowed_length") instanceof Number n) {
-            allowResize = newLen <= n.intValue();
-        }
         if (!allowResize) {
             if (existingAtStart != null && newLen > existingAtStart.getLength()) {
                 throw new ApiError("UNSAFE_GLOBAL_TYPE",
@@ -643,7 +700,8 @@ final class EditService {
         String target = ApiError.reqStr(op, "target");
         Address addr = ws.parseAddress(target);
         if (addr == null) throw new ApiError("INVALID_ARGUMENT", "Invalid address for clear_data: " + target, null);
-        int len = ApiError.optInt(op, "length", 1, 1, 65536);
+        long len = ApiError.reqLong(op, "length", null);
+        if (len <= 0) throw new ApiError("INVALID_ARGUMENT", "length must be positive", null);
 
         Address end;
         try {

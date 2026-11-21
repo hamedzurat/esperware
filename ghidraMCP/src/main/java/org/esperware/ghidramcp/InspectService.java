@@ -9,7 +9,7 @@ import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeComponent;
 import ghidra.program.model.data.Pointer;
 import ghidra.program.model.data.Structure;
-import ghidra.program.model.data.TypedefDataType;
+import ghidra.program.model.data.TypeDef;
 import ghidra.program.model.data.Union;
 import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.listing.Data;
@@ -37,11 +37,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /** Thread-safe read-only query service backing all 9 read MCP tools and WebUI inspection endpoints. */
 final class InspectService {
     private static final int DECOMPILE_TIMEOUT_SEC = 30;
     private static final int SEARCH_DECOMPILE_TIMEOUT_SEC = 2;
+    private static final long PSEUDOCODE_SEARCH_BUDGET_NANOS = TimeUnit.SECONDS.toNanos(3);
     private static final int PSEUDOCODE_SLICE_CHARS = 24_000;
     private static final int MAX_LIST_LIMIT = 200;
     private static final int MAX_MEMORY_BYTES = 4096;
@@ -126,9 +128,10 @@ final class InspectService {
             } else if ("size".equals(sort)) {
                 all.sort((a, b) -> Long.compare(b.getBody().getNumAddresses(), a.getBody().getNumAddresses()));
             }
-            int end = Math.min(start + limit, all.size());
-            List<Map<String, Object>> page = new ArrayList<>(Math.max(0, end - start));
-            for (int i = start; i < end; i++) {
+            int pageStart = Math.min(start, all.size());
+            int end = pageStart + Math.min(limit, all.size() - pageStart);
+            List<Map<String, Object>> page = new ArrayList<>(end - pageStart);
+            for (int i = pageStart; i < end; i++) {
                 Function fn = all.get(i);
                 Map<String, Object> row = new LinkedHashMap<>();
                 row.put("address", fn.getEntryPoint().toString());
@@ -162,13 +165,14 @@ final class InspectService {
 
         return ws.withReadLock(() -> {
             List<Map<String, Object>> items = collectSymbols(kind, folded);
-            int end = Math.min(start + limit, items.size());
+            int pageStart = Math.min(start, items.size());
+            int end = pageStart + Math.min(limit, items.size() - pageStart);
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("ok", true);
             out.put("version", store.currentVersion());
             out.put("kind", kind);
             out.put("total", items.size());
-            out.put("items", items.subList(start, end));
+            out.put("items", items.subList(pageStart, end));
             if (end < items.size()) out.put("next_cursor", ApiError.encodeCursor(gson, new OffsetCursor(end)));
             return out;
         });
@@ -178,7 +182,7 @@ final class InspectService {
         Program p = ws.program();
         List<Map<String, Object>> items = new ArrayList<>();
         switch (kind) {
-            case "imports" -> addSymbolRows(p.getSymbolTable().getExternalSymbols(), folded, false, items);
+            case "imports" -> addSymbolRows(p.getSymbolTable().getExternalSymbols(), folded, items);
             case "exports" -> {
                 SymbolIterator it = p.getSymbolTable().getAllSymbols(true);
                 while (it.hasNext()) {
@@ -243,10 +247,9 @@ final class InspectService {
         return items;
     }
 
-    private static void addSymbolRows(SymbolIterator it, String folded, boolean requireGlobal, List<Map<String, Object>> out) {
+    private static void addSymbolRows(SymbolIterator it, String folded, List<Map<String, Object>> out) {
         while (it.hasNext()) {
             Symbol s = it.next();
-            if (requireGlobal && !s.isGlobal()) continue;
             if (matches(s.getName(true), s.getAddress().toString(), folded)) out.add(symbolRow(s));
         }
     }
@@ -423,13 +426,14 @@ final class InspectService {
                 }
             }
 
-            int end = Math.min(start + limit, xrefs.size());
+            int pageStart = Math.min(start, xrefs.size());
+            int end = pageStart + Math.min(limit, xrefs.size() - pageStart);
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("ok", true);
             out.put("version", store.currentVersion());
             out.put("target", addr.toString());
             out.put("total", xrefs.size());
-            out.put("xrefs", xrefs.subList(start, end));
+            out.put("xrefs", xrefs.subList(pageStart, end));
             if (end < xrefs.size()) out.put("next_cursor", ApiError.encodeCursor(gson, new OffsetCursor(end)));
             return out;
         });
@@ -617,12 +621,20 @@ final class InspectService {
         }
         List<Map<String, Object>> matches = new ArrayList<>();
         int scanned = 0;
+        long deadline = System.nanoTime() + PSEUDOCODE_SEARCH_BUDGET_NANOS;
+        boolean paused = false;
         while (it.hasNext() && scanned < 25 && matches.size() < limit) {
+            if (System.nanoTime() - deadline >= 0) break;
             Function fn = it.next();
+            ProgramWorkspace.CachedDecompile res = fn.isExternal() ? null
+                    : ws.decompileCached(fn, SEARCH_DECOMPILE_TIMEOUT_SEC, deadline);
+            if (!fn.isExternal() && res == null) {
+                paused = true;
+                break;
+            }
             pos++;
             scanned++;
-            if (fn.isExternal()) continue;
-            ProgramWorkspace.CachedDecompile res = ws.decompileCached(fn, SEARCH_DECOMPILE_TIMEOUT_SEC);
+            if (res == null) continue;
             if (!"complete".equals(res.status()) || res.code() == null) continue;
             int idx = res.code().toLowerCase(Locale.ROOT).indexOf(folded);
             if (idx >= 0) {
@@ -640,7 +652,10 @@ final class InspectService {
         out.put("scope", "pseudocode");
         out.put("scanned_functions", scanned);
         out.put("matches", matches);
-        if (it.hasNext()) {
+        if (paused && scanned == 0) {
+            throw new ApiError("DECOMPILER_BUSY", "Decompile budget exhausted. Retry this search page.", null);
+        }
+        if (paused || it.hasNext()) {
             out.put("next_cursor", ApiError.encodeCursor(gson, new SearchCursor(query, "pseudocode", null, pos)));
         }
         return out;
@@ -672,9 +687,10 @@ final class InspectService {
             }
             List<DataType> found = new ArrayList<>(byPath.values());
             found.sort(Comparator.comparing(DataType::getPathName, String.CASE_INSENSITIVE_ORDER));
-            int end = Math.min(start + limit, found.size());
-            List<Map<String, Object>> page = new ArrayList<>(Math.max(0, end - start));
-            for (int i = start; i < end; i++) page.add(describeType(found.get(i)));
+            int pageStart = Math.min(start, found.size());
+            int end = pageStart + Math.min(limit, found.size() - pageStart);
+            List<Map<String, Object>> page = new ArrayList<>(end - pageStart);
+            for (int i = pageStart; i < end; i++) page.add(describeType(found.get(i)));
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("ok", true);
             out.put("version", store.currentVersion());
@@ -712,12 +728,12 @@ final class InspectService {
             row.put("fields_truncated", comps.length > cap);
         } else if (type instanceof ghidra.program.model.data.Enum en) {
             String[] names = en.getNames();
-            long[] vals = en.getValues();
             int cap = Math.min(names.length, TYPE_COMPONENTS_CAP);
             List<Map<String, Object>> entries = new ArrayList<>(cap);
-            for (int i = 0; i < cap; i++) entries.add(Map.of("name", names[i], "value", vals[i]));
+            for (int i = 0; i < cap; i++) entries.add(Map.of("name", names[i], "value", en.getValue(names[i])));
             row.put("values", entries);
-        } else if (type instanceof TypedefDataType td) {
+            row.put("values_truncated", names.length > cap);
+        } else if (type instanceof TypeDef td) {
             row.put("base_type", td.getDataType().getDisplayName());
             row.put("base_path", td.getDataType().getPathName());
         } else if (type instanceof Pointer ptr && ptr.getDataType() != null) {
@@ -735,7 +751,7 @@ final class InspectService {
         if (type instanceof Union) return "union";
         if (type instanceof Composite) return "composite";
         if (type instanceof ghidra.program.model.data.Enum) return "enum";
-        if (type instanceof TypedefDataType) return "typedef";
+        if (type instanceof TypeDef) return "typedef";
         if (type instanceof Pointer) return "pointer";
         if (type instanceof Array) return "array";
         return "scalar";

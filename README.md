@@ -6,7 +6,7 @@ Headless Ghidra 12.2 MCP server with versioned edits, read-only subagent endpoin
 
 - `justfile`: shortcut commands to start, inspect, and stop a binary container.
 - `ghidraMCP/`: headless Java Ghidra server, container build, and JUnit 5 test suite. See [the architecture notes](ghidraMCP/README.md) for internals.
-- `wui/`: standalone browser page that connects to a running server port to inspect versions, unified diffs, and functions.
+- `wui/`: standalone browser viewer for versions, unified diffs, and functions.
 - `artifacts/`: C test sources and a `justfile` that builds `-O1` stripped and unstripped ELF binaries into `artifacts/build/`.
 
 ## Build test binaries
@@ -39,7 +39,7 @@ just run ./artifacts/build/readability-fixture.stripped.elf 8765 /tmp/my-run
 - Subagents (read-only, 9 tools): `http://127.0.0.1:8765/mcp/ro`
 - REST and SSE API: `http://127.0.0.1:8765/api/v1`
 
-Open [the WebUI page](wui/index.html) directly (or run `just wui 8765`) to view versions, unified diffs, and functions.
+The [standalone WUI](wui/index.html) reads the server's REST and event APIs. To open it from disk, set `GHIDRA_MCP_CORS_ORIGIN=null` when you start the container with `just run` or `just resume`. Then run `just wui 8765`. If you host the WUI separately over HTTP, set the server's allowed origin to the WUI's scheme, hostname, and port. Enter the target server's port, base URL, or MCP endpoint URL in the WUI. If you configured tokens, enter the read token there.
 
 Manage running containers with:
 
@@ -73,7 +73,7 @@ Passing `--port 0` binds a free ephemeral port and writes the chosen port into `
 
 | Flag | Environment variable | Purpose |
 |---|---|---|
-| `--binary <path>` | — | Target binary to import on first run. |
+| `--binary <path>` | — | Target binary. If the work directory already contains a project, the binary must match it. |
 | `--work-dir <path>` | — | Run directory for `ghidra-project/`, `history.sqlite`, and `ready.json`. |
 | `--cache-dir <path>` | `GHIDRA_MCP_CACHE_DIR` | Directory for analyzed `.gpr` templates keyed by binary SHA-256. |
 | `--no-cache` | — | Disable the SHA-256 project cache. |
@@ -81,9 +81,11 @@ Passing `--port 0` binds a free ephemeral port and writes the chosen port into `
 | `--port <num>` | `GHIDRA_MCP_PORT` | HTTP port (`0` for ephemeral, default `8765`). |
 | `--public-url <url>` | `GHIDRA_MCP_PUBLIC_URL` | Base URL advertised in `ready.json` and `/api/v1/status`. |
 | `--decompiler-pool <n>` | — | Concurrent `DecompInterface` worker count (default `2`). |
-| `--cors-origin <origin>` | `GHIDRA_MCP_CORS_ORIGIN` | `Access-Control-Allow-Origin` header value (default `*`). |
-| `--rw-token <token>` | `GHIDRA_MCP_RW_TOKEN` | Bearer token required on `/mcp/rw` and `POST /api/v1/shutdown`. |
-| `--ro-token <token>` | `GHIDRA_MCP_RO_TOKEN` | Bearer token required on `/mcp/ro` (`--rw-token` also accepted). |
+| `--cors-origin <origin>` | `GHIDRA_MCP_CORS_ORIGIN` | Adds one allowed browser origin. Use `null` if you deliberately open the viewer as a local file. |
+| `--rw-token <token>` | `GHIDRA_MCP_RW_TOKEN` | Bearer token for write endpoints, shutdown, and read endpoints. |
+| `--ro-token <token>` | `GHIDRA_MCP_RO_TOKEN` | Bearer token for `/mcp/ro` and the REST inspection and event endpoints. |
+
+When either token is configured, inspection routes require a bearer token and write routes require the write token. You can leave both unset for trusted local use. The standalone WUI requires an allowed browser origin.
 
 ## MCP tools
 

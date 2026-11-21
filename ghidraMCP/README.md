@@ -34,8 +34,8 @@ flowchart LR
 | `InspectService` | Implements the 9 read-only MCP queries and live inspection REST handlers under read lock. |
 | `EditService` | Enforces `AccessMode.READ_WRITE`, checks `expected_version`, runs single-transaction edits, computes diffs, and applies multi-step reverts under write lock. |
 | `VersionStore` | SQLite WAL ledger storing `v0` metadata, ordered mutation versions, inverse operations, function diffs, checkpoints, and SSE event listeners. |
-| `McpEndpoints` | Registers `/mcp/rw` and `/mcp/ro` `HttpServletStreamableServerTransportProvider` instances with `ToolAnnotations` and Host/Origin checks. |
-| `WebApiServlet` | Serves `/api/v1/*` JSON endpoints, async SSE `/api/v1/events`, CORS headers, and `POST /api/v1/shutdown`. |
+| `McpEndpoints` | Registers the read-only and read-write MCP transports with tool annotations. |
+| `WebApiServlet` | Serves the JSON API, the event stream, and the shutdown route. |
 | `ApiError` | Typed fault (`code`, `currentVersion`), `AccessMode` enum, request argument validation, cursor codec, and LCS unified diff generator. |
 
 ## Classloader and headless boot
@@ -55,7 +55,7 @@ Ghidra 12.2 requires `-Djava.system.class.loader=ghidra.GhidraClassLoader`. Beca
 
 Jetty starts before Ghidra opens the binary. Two `ProxyServlet` placeholders on `/mcp/rw` and `/mcp/ro` return HTTP `503` while `WebApiServlet` serves `/api/v1/health` with `status: "analyzing"`. Once `ProgramWorkspace` and `VersionStore` finish initialization, `GhidraMcpLauncher` attaches the real MCP transports, marks the servlet `ready`, writes `ready.json` atomically via `.tmp` rename, and prints the ready JSON line to `stdout`.
 
-On `SIGTERM` or `POST /api/v1/shutdown`, `GhidraMcpLauncher` deletes `ready.json`, completes active SSE `AsyncContext` connections, stops Jetty (`stopTimeout = 1000ms`), closes the MCP servers, closes SQLite, saves any unsaved `Program` changes before closing `GhidraProject`, and exits with code `0` so Ghidra and Reactor daemon threads do not stall container teardown.
+On shutdown, `GhidraMcpLauncher` removes `ready.json`, interrupts the event workers, and closes Jetty, the MCP transports, SQLite, and the Ghidra project. Each successful edit is already saved.
 
 ## Workspace concurrency, caching, and Ghidra internals
 
@@ -63,23 +63,28 @@ On `SIGTERM` or `POST /api/v1/shutdown`, `GhidraMcpLauncher` deletes `ready.json
 - **Locking and decompiler pooling**: Read queries acquire `rwLock.readLock()` and borrow one `DecompInterface` from a bounded `ArrayBlockingQueue` (default size `2`), allowing concurrent read-only subagent calls. Mutations acquire `rwLock.writeLock()`, invalidate `decompileCache` (up to `512` immutable entries), and flush every `DecompInterface` cache.
 - **Decompiler vs database variables**: `Function.getAllVariables()` omits variables synthesized only in decompiler output (`local_*`, `uVar*`, `param_*`). `ProgramWorkspace.extractVariables` merges `HighFunction.getLocalSymbolMap().getSymbols()` with DB variables. `EditService` resolves `HighSymbol` targets and commits renames, types, and variable comments back to the Ghidra database via `HighFunctionDBUtil.updateDBVariable(...)`, tracking intra-batch aliases so a later op in the same `apply_edits` array sees an earlier rename.
 - **Data types and global safety**: `InspectService.getType` searches both `program.getDataTypeManager()` and `BuiltInDataTypeManager.getDataTypeManager()`. `EditService.defineType` parses C declarations inside an isolated `StandAloneDataTypeManager` first so invalid C cannot mutate the program. `parseType` accepts full category paths, unique short names (including pointers/arrays), and C primitives. Global type updates enforce non-executable memory with no instructions; larger replacements or overlays across adjacent globals require `allow_resize=true`, which captures every overwritten data unit (and its comments) for lossless multi-op `revert`.
-- **Function recovery & transactions**: `EditService` supports `create_function` (using `DisassembleCommand` if needed + `CreateFunctionCmd`) alongside intra-batch function alias tracking. All mutations commit via `GhidraProject.checkPoint` and immediately roll back via `GhidraProject.rollback` on failure so an aborted transaction never poisons later `save_checkpoint` calls.
+- `create_function` disassembles code when needed and creates a function. `EditService` uses Ghidra's managed transaction to roll back an edit if the error occurs before the project save begins.
+- Pseudocode search uses a three-second decompiler budget per page. If the budget runs out, its cursor resumes at the next unprocessed function.
+- Each event stream uses a worker and a bounded queue. A shutdown, disconnect, or full queue stops the worker. Idle connections send a heartbeat every five seconds. Edit requests only enqueue events.
 
 ## Version store and rollback
 
-`VersionStore` persists a linear ledger in `--work-dir/history.sqlite` (WAL mode, synchronous `NORMAL`):
+`VersionStore` persists a linear ledger in `--work-dir/history.sqlite` with WAL mode and `synchronous=FULL`.
 
-- `meta`: stores `binary_name`, `binary_sha256`, `ghidra_version`, and `arch`.
+- `meta` stores binary metadata and tracks the pending version and the first version recorded with the current type rules.
 - `versions`: stores sequential `version` (`0` for `initial`), `parent_version`, `created_at`, `actor`, `operation`, `reason`, `checkpoint_label`, `ops_json`, `inverse_ops_json`, and `functions_json`.
 - `function_diffs`: stores per-touched-function `before_c`, `after_c`, `diff_text`, and `decompile_status`.
 
-Every `apply_edits`, `define_type`, and `revert` call requires `expected_version` matching `store.currentVersion()`, commits one Ghidra transaction, redecompiles touched functions once, computes a line-based LCS unified diff (`ApiError.unifiedDiff`), and appends one SQLite transaction.
+Every edit checks `expected_version` before making changes. The server writes the candidate version and diffs to SQLite as pending. It saves the project with the same version number, then publishes the version in the ledger. Startup compares the pending version with the saved project and either publishes or discards the pending row. If the saved and recorded versions cannot be reconciled, startup fails. If a save or publication fails during an edit, inspection returns HTTP 503 and health reports `recovery_required` until restart.
 
-Multi-step `revert(to_version, expected_version)` queries `inverse_ops_json` in descending version order across `(to_version, current_version]` and applies them in one Ghidra transaction, recording the rollback itself as a new version so timeline history stays append-only. Note that reverting `define_type` removes newly created types by path (`remove_type`), while overwritten composite definitions require restoring from a saved `.gpr` project checkpoint.
+Older projects have no saved version number. On first open, the server pairs the saved project with the current ledger version and starts tracking that pair. An inconsistency from a crash before the upgrade cannot be detected by the new marker.
 
-Cross-stage diffs (`GET /api/v1/diff?from=A&to=B`) select each function's earliest `before_c` and latest `after_c` in `(A, B]` and recompute the unified diff.
+`revert` checks the entire requested range before applying inverse operations and records a new version on success. `define_type` rejects overwrites. A revert that crosses a legacy type definition or a version with an operation the server cannot reverse returns `REVERT_UNAVAILABLE`. `save_checkpoint` labels the current saved version.
+
+Range diffs compare pseudocode by function address. When a name filter matches a function, the diff includes its earlier edits in the range under other names.
 
 ## Transport and access control
 
 - **Role isolation**: `McpEndpoints` mounts `/mcp/ro` with only the 9 read tool specifications (`readOnlyHint = true`) and `/mcp/rw` with all 13 tools (`apply_edits`, `define_type`, `revert`, `save_checkpoint` marked `readOnlyHint = false`). `EditService` also checks `AccessMode.READ_WRITE` at entry as defense in depth.
-- **HTTP security and CORS**: A custom `ServerTransportSecurityValidator` allows loopback `Host` headers on ephemeral or fixed ports (and any `Host` when bound to `0.0.0.0`). An optional Jakarta `Filter` enforces `Authorization: Bearer <token>` on `/mcp/rw`, `/mcp/ro`, and `POST /api/v1/shutdown` when configured. `WebApiServlet` sets `Access-Control-Allow-Origin` (`*` by default) so external WebUI pages can query REST and SSE endpoints.
+- A single HTTP filter checks the host, origin, and bearer token for both transports. Loopback hosts, the configured bind host, and the host in `--public-url` are accepted. Browser requests can use the server's origin or one explicit origin from `--cors-origin`.
+- When tokens are configured, either token authorizes inspection, including the REST and event routes. The write token authorizes mutations and shutdown. The health endpoint can load without a token. The standalone viewer calls the REST and event endpoints over HTTP.

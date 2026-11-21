@@ -22,6 +22,8 @@ import java.util.function.Consumer;
 
 /** Linear SQLite-backed version ledger storing every mutation step, inverse ops, and pseudocode diffs. */
 final class VersionStore implements AutoCloseable {
+    private static final String PENDING_VERSION = "pending_version";
+    private static final String REVERSIBLE_TYPES_FROM = "reversible_types_from";
     private static final Type MAP_LIST_TYPE = new TypeToken<List<Map<String, Object>>>() {}.getType();
 
     record FunctionDiff(
@@ -34,10 +36,16 @@ final class VersionStore implements AutoCloseable {
 
     record SseEvent(String type, Map<String, Object> data) {}
 
+    @FunctionalInterface
+    interface ProjectSave {
+        void save(long version) throws Exception;
+    }
+
     private final Connection db;
     private final Gson gson = new Gson();
     private final CopyOnWriteArrayList<Consumer<SseEvent>> listeners = new CopyOnWriteArrayList<>();
     private long currentVersion;
+    private long reversibleTypesFrom;
 
     VersionStore(Path dbFile) throws Exception {
         Path abs = dbFile.toAbsolutePath();
@@ -45,7 +53,7 @@ final class VersionStore implements AutoCloseable {
         db = DriverManager.getConnection("jdbc:sqlite:" + abs);
         try (Statement s = db.createStatement()) {
             s.execute("PRAGMA journal_mode=WAL");
-            s.execute("PRAGMA synchronous=NORMAL");
+            s.execute("PRAGMA synchronous=FULL");
             s.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
             s.execute("CREATE TABLE IF NOT EXISTS versions ("
                     + "version INTEGER PRIMARY KEY, "
@@ -104,7 +112,65 @@ final class VersionStore implements AutoCloseable {
                 db.setAutoCommit(true);
             }
         } else {
-            currentVersion = queryMaxVersion();
+            String savedHash = metadata().get("binary_sha256");
+            String hash = meta.get("binary_sha256");
+            if (!(hash == null ? savedHash == null : hash.equalsIgnoreCase(savedHash))) {
+                throw new SQLException("History belongs to a different binary");
+            }
+        }
+    }
+
+    synchronized void recover(long savedVersion, ProjectSave saveProject) throws Exception {
+        Map<String, String> meta = metadata();
+        String pending = meta.get(PENDING_VERSION);
+        long latest = queryMaxVersion();
+        if (pending != null) {
+            long version = Long.parseLong(pending);
+            if (version != latest || version <= 0 || (savedVersion != version && savedVersion != version - 1)) {
+                throw new SQLException("Pending history version does not match the saved project");
+            }
+            finishPending(version, savedVersion == version);
+            latest = savedVersion;
+        } else if (savedVersion != ProgramWorkspace.UNTRACKED_VERSION && savedVersion != latest) {
+            throw new SQLException("Saved project version does not match history");
+        }
+
+        String firstReversible = meta.get(REVERSIBLE_TYPES_FROM);
+        if (firstReversible == null) {
+            reversibleTypesFrom = latest + 1;
+            putMetadata(REVERSIBLE_TYPES_FROM, Long.toString(reversibleTypesFrom));
+        } else {
+            reversibleTypesFrom = Long.parseLong(firstReversible);
+            if (savedVersion == ProgramWorkspace.UNTRACKED_VERSION && latest >= reversibleTypesFrom) {
+                throw new SQLException("Saved project is missing its history version");
+            }
+        }
+        if (savedVersion == ProgramWorkspace.UNTRACKED_VERSION) saveProject.save(latest);
+        currentVersion = latest;
+    }
+
+    private void putMetadata(String key, String value) throws SQLException {
+        try (PreparedStatement ps = db.prepareStatement("INSERT INTO meta(key, value) VALUES (?, ?)")) {
+            ps.setString(1, key);
+            ps.setString(2, value);
+            ps.executeUpdate();
+        }
+    }
+
+    private void finishPending(long version, boolean keep) throws SQLException {
+        db.setAutoCommit(false);
+        try (Statement s = db.createStatement()) {
+            if (!keep) {
+                s.executeUpdate("DELETE FROM function_diffs WHERE version = " + version);
+                s.executeUpdate("DELETE FROM versions WHERE version = " + version);
+            }
+            s.executeUpdate("DELETE FROM meta WHERE key = 'pending_version'");
+            db.commit();
+        } catch (SQLException e) {
+            db.rollback();
+            throw e;
+        } finally {
+            db.setAutoCommit(true);
         }
     }
 
@@ -126,7 +192,8 @@ final class VersionStore implements AutoCloseable {
             String reason,
             Object ops,
             Object inverseOps,
-            List<FunctionDiff> diffs) throws SQLException {
+            List<FunctionDiff> diffs,
+            ProjectSave saveProject) throws Exception {
         long newVer;
         List<Map<String, Object>> fnSummary = new ArrayList<>(diffs.size());
         for (FunctionDiff d : diffs) {
@@ -137,6 +204,9 @@ final class VersionStore implements AutoCloseable {
             fnSummary.add(item);
         }
         String now = Instant.now().toString();
+        String opsJson = gson.toJson(ops == null ? List.of() : ops);
+        String inverseJson = gson.toJson(inverseOps == null ? List.of() : inverseOps);
+        String functionsJson = gson.toJson(fnSummary);
         synchronized (this) {
             long parent = currentVersion;
             newVer = parent + 1;
@@ -152,9 +222,9 @@ final class VersionStore implements AutoCloseable {
                     ps.setString(5, operation);
                     if (reason == null) ps.setNull(6, Types.VARCHAR);
                     else ps.setString(6, reason);
-                    ps.setString(7, gson.toJson(ops == null ? List.of() : ops));
-                    ps.setString(8, gson.toJson(inverseOps == null ? List.of() : inverseOps));
-                    ps.setString(9, gson.toJson(fnSummary));
+                    ps.setString(7, opsJson);
+                    ps.setString(8, inverseJson);
+                    ps.setString(9, functionsJson);
                     ps.executeUpdate();
                 }
                 if (!diffs.isEmpty()) {
@@ -176,14 +246,17 @@ final class VersionStore implements AutoCloseable {
                         ps.executeBatch();
                     }
                 }
+                putMetadata(PENDING_VERSION, Long.toString(newVer));
                 db.commit();
-                currentVersion = newVer;
-            } catch (SQLException ex) {
+            } catch (SQLException | RuntimeException ex) {
                 db.rollback();
                 throw ex;
             } finally {
                 db.setAutoCommit(true);
             }
+            saveProject.save(newVer);
+            finishPending(newVer, true);
+            currentVersion = newVer;
         }
         Map<String, Object> evt = new LinkedHashMap<>();
         evt.put("version", newVer);
@@ -215,28 +288,32 @@ final class VersionStore implements AutoCloseable {
     synchronized List<Map<String, Object>> listVersions() throws SQLException {
         List<Map<String, Object>> out = new ArrayList<>();
         String sql = "SELECT version, parent_version, created_at, actor, operation, reason, checkpoint_label, ops_json, functions_json "
-                + "FROM versions ORDER BY version ASC";
-        try (Statement s = db.createStatement(); ResultSet r = s.executeQuery(sql)) {
-            while (r.next()) {
-                Map<String, Object> row = new LinkedHashMap<>();
-                row.put("version", r.getLong("version"));
-                long parent = r.getLong("parent_version");
-                row.put("parent_version", r.wasNull() ? null : parent);
-                row.put("created_at", r.getString("created_at"));
-                row.put("actor", r.getString("actor"));
-                row.put("operation", r.getString("operation"));
-                row.put("reason", r.getString("reason"));
-                row.put("checkpoint_label", r.getString("checkpoint_label"));
-                List<Map<String, Object>> ops = parseMapList(r.getString("ops_json"));
-                row.put("ops_count", ops.size());
-                row.put("functions", parseMapList(r.getString("functions_json")));
-                out.add(row);
+                + "FROM versions WHERE version <= ? ORDER BY version ASC";
+        try (PreparedStatement ps = db.prepareStatement(sql)) {
+            ps.setLong(1, currentVersion);
+            try (ResultSet r = ps.executeQuery()) {
+                while (r.next()) {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("version", r.getLong("version"));
+                    long parent = r.getLong("parent_version");
+                    row.put("parent_version", r.wasNull() ? null : parent);
+                    row.put("created_at", r.getString("created_at"));
+                    row.put("actor", r.getString("actor"));
+                    row.put("operation", r.getString("operation"));
+                    row.put("reason", r.getString("reason"));
+                    row.put("checkpoint_label", r.getString("checkpoint_label"));
+                    List<Map<String, Object>> ops = parseMapList(r.getString("ops_json"));
+                    row.put("ops_count", ops.size());
+                    row.put("functions", parseMapList(r.getString("functions_json")));
+                    out.add(row);
+                }
             }
         }
         return out;
     }
 
     synchronized Map<String, Object> getVersion(long version) throws SQLException {
+        if (version > currentVersion) return null;
         Map<String, Object> out = null;
         try (PreparedStatement ps = db.prepareStatement(
                 "SELECT version, parent_version, created_at, actor, operation, reason, checkpoint_label, ops_json "
@@ -281,12 +358,22 @@ final class VersionStore implements AutoCloseable {
     synchronized List<Map<String, Object>> inverseOpsRange(long fromExclusive, long toInclusive) throws SQLException {
         List<Map<String, Object>> result = new ArrayList<>();
         try (PreparedStatement ps = db.prepareStatement(
-                "SELECT inverse_ops_json FROM versions WHERE version > ? AND version <= ? ORDER BY version DESC")) {
+                "SELECT version, operation, ops_json, inverse_ops_json FROM versions "
+                        + "WHERE version > ? AND version <= ? ORDER BY version DESC")) {
             ps.setLong(1, fromExclusive);
             ps.setLong(2, toInclusive);
             try (ResultSet r = ps.executeQuery()) {
                 while (r.next()) {
-                    result.addAll(parseMapList(r.getString(1)));
+                    long version = r.getLong("version");
+                    boolean legacyType = "define_type".equals(r.getString("operation")) && version < reversibleTypesFrom;
+                    boolean destructive = parseMapList(r.getString("ops_json")).stream().anyMatch(op ->
+                            "remove_type".equals(op.get("op")) || "delete_function".equals(op.get("op")));
+                    List<Map<String, Object>> inverses = parseMapList(r.getString("inverse_ops_json"));
+                    if (legacyType || destructive || inverses.isEmpty()) {
+                        throw new ApiError("REVERT_UNAVAILABLE", "History version " + version
+                                + " cannot be fully reversed", currentVersion);
+                    }
+                    result.addAll(inverses);
                 }
             }
         }
@@ -301,7 +388,13 @@ final class VersionStore implements AutoCloseable {
         }
         String sql = "SELECT function_address, function_name, before_c, after_c, decompile_status "
                 + "FROM function_diffs WHERE version > ? AND version <= ? "
-                + (functionFilter != null ? "AND (LOWER(function_address) = LOWER(?) OR LOWER(function_name) = LOWER(?)) " : "")
+                + (functionFilter != null ? """
+                      AND function_address IN (
+                          SELECT function_address FROM function_diffs
+                          WHERE version > ? AND version <= ?
+                            AND (LOWER(function_address) = LOWER(?) OR LOWER(function_name) = LOWER(?))
+                      )
+                      """ : "")
                 + "ORDER BY version ASC, id ASC";
         Map<String, RangeAcc> byAddr = new LinkedHashMap<>();
         try (PreparedStatement ps = db.prepareStatement(sql)) {
@@ -311,8 +404,10 @@ final class VersionStore implements AutoCloseable {
             if (functionFilter != null) {
                 String clean = functionFilter.startsWith("0x") || functionFilter.startsWith("0X")
                         ? functionFilter.substring(2) : functionFilter;
+                ps.setLong(i++, fromVersion);
+                ps.setLong(i++, toVersion);
                 ps.setString(i++, clean);
-                ps.setString(i++, functionFilter);
+                ps.setString(i, functionFilter);
             }
             try (ResultSet r = ps.executeQuery()) {
                 while (r.next()) {

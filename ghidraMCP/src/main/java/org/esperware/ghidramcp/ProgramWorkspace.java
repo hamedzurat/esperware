@@ -23,6 +23,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolType;
 import ghidra.util.Msg;
 import ghidra.util.task.TaskMonitor;
+import ghidra.util.task.TimeoutTaskMonitor;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -42,11 +43,16 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /** Owns the single headless GhidraProject, Program, decompiler pool, decompile cache, and read/write locks. */
 final class ProgramWorkspace implements AutoCloseable {
     private static final int MAX_DECOMPILE_CACHE_ENTRIES = 512;
+    private static final String PROJECT_OPTIONS = "Esperware";
+    private static final String VERSION_OPTION = "History Version";
+    private static final String BINARY_HASH_OPTION = "Binary SHA-256";
+    static final long UNTRACKED_VERSION = -1;
 
     record CachedDecompile(
             String status,
@@ -70,6 +76,8 @@ final class ProgramWorkspace implements AutoCloseable {
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
     private final ArrayBlockingQueue<DecompInterface> decompPool;
     private final ConcurrentHashMap<String, CachedDecompile> decompileCache = new ConcurrentHashMap<>();
+    private boolean savingVersion;
+    private volatile boolean recoveryRequired;
 
     private ProgramWorkspace(
             GhidraProject project,
@@ -112,9 +120,18 @@ final class ProgramWorkspace implements AutoCloseable {
         if (Files.exists(gpr)) {
             project = GhidraProject.openProject(projDir.toString(), "workspace", true);
             program = openSoleProgram(project);
-            sha256 = resolveSha256(binaryPath, program);
-            binaryName = binaryPath != null ? binaryPath.getFileName().toString() : program.getName();
+            try {
+                sha256 = savedBinaryHash(program);
+                if (binaryPath != null) requireMatchingHash(sha256File(binaryPath), sha256);
+                binaryName = program.getName();
+            } catch (Exception e) {
+                project.close();
+                throw e;
+            }
         } else {
+            if (Files.exists(absWork.resolve("history.sqlite"))) {
+                throw new IOException("Workspace history exists without its saved Ghidra project");
+            }
             if (binaryPath == null || !Files.isRegularFile(binaryPath)) {
                 throw new IllegalArgumentException("Binary not found: " + binaryPath);
             }
@@ -127,6 +144,13 @@ final class ProgramWorkspace implements AutoCloseable {
                 copyProjectDir(cachedProj, projDir);
                 project = GhidraProject.openProject(projDir.toString(), "workspace", true);
                 program = openSoleProgram(project);
+                try {
+                    requireMatchingHash(sha256, savedBinaryHash(program));
+                } catch (IOException e) {
+                    project.close();
+                    throw e;
+                }
+                binaryName = program.getName();
             } else {
                 Files.createDirectories(projDir);
                 project = GhidraProject.createProject(projDir.toString(), "workspace", false);
@@ -135,7 +159,14 @@ final class ProgramWorkspace implements AutoCloseable {
                     project.close();
                     throw new IOException("Ghidra could not import " + absBin);
                 }
+                try {
+                    validateExecutableHash(program, sha256);
+                } catch (IOException e) {
+                    project.close();
+                    throw e;
+                }
                 GhidraProject.analyze(program);
+                program.getOptions(PROJECT_OPTIONS).setString(BINARY_HASH_OPTION, sha256);
                 project.saveAs(program, "/", binaryName, true);
                 if (cachedProj != null) {
                     populateCache(projDir, cachedProj);
@@ -166,6 +197,7 @@ final class ProgramWorkspace implements AutoCloseable {
     <T> T withReadLock(CheckedWork<T> work) throws Exception {
         rwLock.readLock().lock();
         try {
+            requireUsable();
             return work.run();
         } finally {
             rwLock.readLock().unlock();
@@ -175,34 +207,67 @@ final class ProgramWorkspace implements AutoCloseable {
     <T> T withWriteLock(CheckedWork<T> work) throws Exception {
         rwLock.writeLock().lock();
         try {
+            requireUsable();
             return work.run();
         } finally {
             rwLock.writeLock().unlock();
         }
     }
 
-    /** Runs mutations inside GhidraProject's managed transaction, committing via checkPoint or rolling back on failure. */
-    <T> T runInTransaction(CheckedWork<T> work) throws Exception {
+    /** Work must publish its version as its final step. */
+    <T> T runEdit(CheckedWork<T> work) throws Exception {
         try {
-            T result = work.run();
-            TransactionInfo info = program.getCurrentTransactionInfo();
-            if (info != null && info.getStatus() == TransactionInfo.Status.ABORTED) {
-                project.rollback(program);
-                invalidateCache();
-                throw new ApiError("EDIT_FAILED", "Transaction was aborted by an internal Ghidra operation", null);
+            return work.run();
+        } catch (Throwable failure) {
+            if (savingVersion) {
+                recoveryRequired = true;
+            } else {
+                try {
+                    project.rollback(program);
+                    invalidateCache();
+                } catch (Throwable rollbackFailure) {
+                    recoveryRequired = true;
+                    failure.addSuppressed(rollbackFailure);
+                }
             }
-            project.checkPoint(program);
-            return result;
-        } catch (Throwable t) {
-            try {
-                project.rollback(program);
-            } catch (Throwable rollbackEx) {
-                t.addSuppressed(rollbackEx);
+            if (recoveryRequired && failure instanceof Exception) {
+                ApiError error = new ApiError("RECOVERY_REQUIRED", "Restart the server to recover the workspace", null);
+                error.initCause(failure);
+                throw error;
             }
-            invalidateCache();
-            if (t instanceof Exception e) throw e;
-            if (t instanceof Error e) throw e;
-            throw new RuntimeException(t);
+            throw failure;
+        }
+    }
+
+    long savedVersion() {
+        return program.getOptions(PROJECT_OPTIONS).getLong(VERSION_OPTION, UNTRACKED_VERSION);
+    }
+
+    void checkEditTransaction() {
+        TransactionInfo info = program.getCurrentTransactionInfo();
+        if (info == null || info.getStatus() != TransactionInfo.Status.NOT_DONE) {
+            throw new ApiError("EDIT_FAILED", "No active Ghidra transaction to save", null);
+        }
+    }
+
+    void saveVersion(long version) throws IOException {
+        savingVersion = true;
+        program.getOptions(PROJECT_OPTIONS).setString(BINARY_HASH_OPTION, binarySha256);
+        program.getOptions(PROJECT_OPTIONS).setLong(VERSION_OPTION, version);
+        project.save(program);
+    }
+
+    void versionPublished() {
+        savingVersion = false;
+    }
+
+    boolean recoveryRequired() {
+        return recoveryRequired;
+    }
+
+    private void requireUsable() {
+        if (recoveryRequired) {
+            throw new ApiError("RECOVERY_REQUIRED", "Restart the server to recover the workspace", null);
         }
     }
 
@@ -254,11 +319,35 @@ final class ProgramWorkspace implements AutoCloseable {
     }
 
     CachedDecompile decompileCached(Function fn, int timeoutSeconds) throws InterruptedException {
+        return decompileCached(fn, timeoutSeconds, null);
+    }
+
+    CachedDecompile decompileCached(Function fn, int timeoutSeconds, Long deadline) throws InterruptedException {
         String key = fn.getEntryPoint().toString();
         CachedDecompile cached = decompileCache.get(key);
         if (cached != null) return cached;
 
-        LiveDecompile live = decompileFresh(fn, timeoutSeconds);
+        LiveDecompile live;
+        if (deadline == null) {
+            live = decompileFresh(fn, timeoutSeconds);
+        } else {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) return null;
+            DecompInterface iface = decompPool.poll(remaining, TimeUnit.NANOSECONDS);
+            if (iface == null) return null;
+            remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                decompPool.add(iface);
+                return null;
+            }
+            var monitor = TimeoutTaskMonitor.timeoutIn(Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining)), TimeUnit.MILLISECONDS);
+            try {
+                live = decompileUsing(iface, fn, timeoutSeconds, monitor);
+                if (monitor.didTimeout() && !"complete".equals(live.status())) return null;
+            } finally {
+                monitor.cancel();
+            }
+        }
         List<Map<String, Object>> vars = extractVariables(fn, live.highFunction());
         List<Map<String, Object>> globals = extractReferencedGlobals(fn);
         CachedDecompile result = new CachedDecompile(live.status(), live.code(), live.error(), vars, globals);
@@ -270,9 +359,12 @@ final class ProgramWorkspace implements AutoCloseable {
     }
 
     LiveDecompile decompileFresh(Function fn, int timeoutSeconds) throws InterruptedException {
-        DecompInterface iface = decompPool.take();
+        return decompileUsing(decompPool.take(), fn, timeoutSeconds, TaskMonitor.DUMMY);
+    }
+
+    private LiveDecompile decompileUsing(DecompInterface iface, Function fn, int timeoutSeconds, TaskMonitor monitor) {
         try {
-            DecompileResults res = iface.decompileFunction(fn, timeoutSeconds, TaskMonitor.DUMMY);
+            DecompileResults res = iface.decompileFunction(fn, timeoutSeconds, monitor);
             if (res == null) {
                 return new LiveDecompile("failed", "", "Decompiler returned no result", null);
             }
@@ -284,7 +376,7 @@ final class ProgramWorkspace implements AutoCloseable {
             }
             return new LiveDecompile("complete", res.getDecompiledFunction().getC(), null, res.getHighFunction());
         } finally {
-            decompPool.put(iface);
+            decompPool.add(iface);
         }
     }
 
@@ -381,10 +473,6 @@ final class ProgramWorkspace implements AutoCloseable {
         }
     }
 
-    void save() throws IOException {
-        project.save(program);
-    }
-
     @Override
     public void close() {
         rwLock.writeLock().lock();
@@ -399,11 +487,6 @@ final class ProgramWorkspace implements AutoCloseable {
                 } catch (Exception e) {
                     Msg.warn(this, "Decompiler close error: " + e.getMessage());
                 }
-            }
-            try {
-                if (program.isChanged()) project.save(program);
-            } catch (Exception e) {
-                Msg.warn(this, "Program save on close failed: " + e.getMessage());
             }
             try {
                 project.close();
@@ -429,11 +512,24 @@ final class ProgramWorkspace implements AutoCloseable {
         return p;
     }
 
-    private static String resolveSha256(Path binaryPath, Program program) throws Exception {
-        String progSha = program.getExecutableSHA256();
-        if (progSha != null && !progSha.isBlank()) return progSha;
-        if (binaryPath != null && Files.isRegularFile(binaryPath)) return sha256File(binaryPath);
-        return "unknown";
+    private static String savedBinaryHash(Program program) throws IOException {
+        String recorded = program.getOptions(PROJECT_OPTIONS).getString(BINARY_HASH_OPTION, program.getExecutableSHA256());
+        if (recorded == null || recorded.isBlank()) return "unknown";
+        validateExecutableHash(program, recorded);
+        return recorded.toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private static void validateExecutableHash(Program program, String hash) throws IOException {
+        String executableHash = program.getExecutableSHA256();
+        if (executableHash != null && executableHash.matches("[0-9a-fA-F]{64}")) {
+            requireMatchingHash(hash, executableHash);
+        }
+    }
+
+    private static void requireMatchingHash(String requested, String saved) throws IOException {
+        if (!requested.equalsIgnoreCase(saved)) {
+            throw new IOException("Binary does not match the saved workspace. Use a different work directory.");
+        }
     }
 
     static String sha256File(Path file) throws Exception {

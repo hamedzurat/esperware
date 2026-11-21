@@ -2,7 +2,9 @@ package org.esperware.ghidramcp;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.io.IOException;
 import java.nio.file.Path;
+import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -35,12 +37,12 @@ class VersionStoreTest {
                     List.of(Map.of("op", "rename_function", "target", "0x40116d", "new_name", "FUN_0040116d")),
                     List.of(new VersionStore.FunctionDiff(
                             "0040116d",
-                            "transform",
+                            "transform_stage1",
                             "void FUN_0040116d(void) {\n  return;\n}\n",
                             "void transform(void) {\n  return;\n}\n",
                             ApiError.unifiedDiff("FUN_0040116d", "void FUN_0040116d(void) {\n  return;\n}\n",
                                     "void transform(void) {\n  return;\n}\n"),
-                            "complete")));
+                            "complete")), version -> assertEquals(1L, version));
             assertEquals(1L, v1);
 
             long v2 = store.recordVersion(
@@ -56,7 +58,7 @@ class VersionStoreTest {
                             "/* mix helper */\nvoid transform(void) {\n  return;\n}\n",
                             ApiError.unifiedDiff("transform", "void transform(void) {\n  return;\n}\n",
                                     "/* mix helper */\nvoid transform(void) {\n  return;\n}\n"),
-                            "complete")));
+                            "complete")), version -> assertEquals(2L, version));
             assertEquals(2L, v2);
 
             store.tagCheckpoint(v2, "first-pass");
@@ -81,7 +83,7 @@ class VersionStoreTest {
             assertTrue(String.valueOf(diffs.get(0).get("diff")).contains("+void transform"));
 
             // Cross-stage diff from v0 to v2 captures earliest before_c -> latest after_c
-            var range = store.diffRange(0L, 2L, null);
+            var range = store.diffRange(0L, 2L, "transform");
             @SuppressWarnings("unchecked")
             var rangeDiffs = (List<Map<String, Object>>) range.get("diffs");
             assertEquals(1, rangeDiffs.size());
@@ -103,6 +105,56 @@ class VersionStoreTest {
             assertEquals(2L, reopened.currentVersion());
             assertEquals(3, reopened.listVersions().size());
             assertNull(reopened.getVersion(99L));
+        }
+    }
+
+    @Test
+    void recoversInterruptedVersionUsingSavedProjectVersion() throws Exception {
+        for (long savedVersion : List.of(0L, 1L)) {
+            Path db = dir.resolve("pending-" + savedVersion + ".sqlite");
+            var meta = Map.of("binary_sha256", "fixture");
+            var change = List.of(Map.of("op", "rename_function"));
+            try (VersionStore store = new VersionStore(db)) {
+                store.ensureBaseline(meta);
+                store.recover(ProgramWorkspace.UNTRACKED_VERSION, version -> assertEquals(0, version));
+                assertThrows(IOException.class, () -> store.recordVersion(
+                        "test", "apply_edits", null, change, change, List.of(), version -> {
+                            assertEquals(1, version);
+                            throw new IOException("Interrupted before history publication");
+                        }));
+                assertEquals(0, store.currentVersion());
+                assertNull(store.getVersion(1));
+                assertEquals(1, store.listVersions().size());
+            }
+            try (VersionStore store = new VersionStore(db)) {
+                store.ensureBaseline(meta);
+                assertThrows(SQLException.class, () -> store.recover(2, version -> fail("Unexpected save")));
+                store.recover(savedVersion, version -> fail("Unexpected save"));
+                assertEquals(savedVersion, store.currentVersion());
+                assertEquals(savedVersion + 1, store.listVersions().size());
+                assertEquals(savedVersion + 1, store.recordVersion(
+                        "test", "apply_edits", null, change, change, List.of(), version -> {}));
+            }
+        }
+    }
+
+    @Test
+    void legacyTypeDefinitionsBlockAnOtherwiseReversibleRange() throws Exception {
+        Path db = dir.resolve("legacy.sqlite");
+        var definition = List.of(Map.of("op", "define_type"));
+        var inverse = List.of(Map.of("op", "remove_type", "path", "/mcp/Example"));
+        var rename = List.of(Map.of("op", "rename_function"));
+
+        try (VersionStore store = new VersionStore(db)) {
+            store.ensureBaseline(Map.of("binary_sha256", "fixture"));
+            store.recordVersion("test", "define_type", null, definition, inverse, List.of(), version -> {});
+            store.recordVersion("test", "apply_edits", null, rename, rename, List.of(), version -> {});
+        }
+        try (VersionStore store = new VersionStore(db)) {
+            store.recover(ProgramWorkspace.UNTRACKED_VERSION, version -> assertEquals(2, version));
+            ApiError error = assertThrows(ApiError.class, () -> store.inverseOpsRange(0, 2));
+            assertEquals("REVERT_UNAVAILABLE", error.code);
+            assertEquals(rename, store.inverseOpsRange(1, 2));
         }
     }
 }

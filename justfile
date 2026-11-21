@@ -24,6 +24,7 @@ run binary port="8765" dir="":
     {{engine}} run --rm -d --name "$cname" \
       -p "127.0.0.1:{{port}}:8765" \
       -e "GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:{{port}}" \
+      -e GHIDRA_MCP_CORS_ORIGIN \
       -v "$bin_abs:/input/$bin_name:ro" \
       -v "$dir_abs:/data" \
       {{image}} \
@@ -31,10 +32,9 @@ run binary port="8765" dir="":
     for _ in $(seq 1 240); do
       if [ -f "$dir_abs/run/ready.json" ]; then
         cat "$dir_abs/run/ready.json"
-        echo "webui: file://{{justfile_directory()}}/wui/index.html?port={{port}}"
         exit 0
       fi
-      if ! {{engine}} container exists "$cname" 2>/dev/null; then
+      if ! {{engine}} container inspect "$cname" >/dev/null 2>&1; then
         echo "Container $cname exited before becoming ready" >&2
         exit 1
       fi
@@ -55,23 +55,40 @@ resume dir port="8765":
     {{engine}} run --rm -d --name "$cname" \
       -p "127.0.0.1:{{port}}:8765" \
       -e "GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:{{port}}" \
+      -e GHIDRA_MCP_CORS_ORIGIN \
       -v "$dir_abs:/data" \
       {{image}} \
       --work-dir /data/run --cache-dir /data/cache >/dev/null
     for _ in $(seq 1 240); do
       if [ -f "$dir_abs/run/ready.json" ]; then
         cat "$dir_abs/run/ready.json"
-        echo "webui: file://{{justfile_directory()}}/wui/index.html?port={{port}}"
         exit 0
+      fi
+      if ! {{engine}} container inspect "$cname" >/dev/null 2>&1; then
+        echo "Container $cname exited before becoming ready" >&2
+        exit 1
       fi
       sleep 0.25
     done
     echo "Timed out waiting for $dir_abs/run/ready.json" >&2
     exit 1
 
-# Stop a running container cleanly
+# Stop a running container and wait for its name to become reusable
 stop port="8765":
-    @curl -fsS -X POST "http://127.0.0.1:{{port}}/api/v1/shutdown" >/dev/null 2>&1 || {{engine}} stop "ghidra-mcp-{{port}}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cname="ghidra-mcp-{{port}}"
+    if ! curl -fsS --max-time 5 -X POST "http://127.0.0.1:{{port}}/api/v1/shutdown" >/dev/null 2>&1; then
+      if {{engine}} container inspect "$cname" >/dev/null 2>&1; then
+        {{engine}} stop "$cname" >/dev/null
+      fi
+    fi
+    for _ in $(seq 1 80); do
+      if ! {{engine}} container inspect "$cname" >/dev/null 2>&1; then exit 0; fi
+      sleep 0.25
+    done
+    echo "Timed out waiting for $cname to stop" >&2
+    exit 1
 
 # Show live server status
 status port="8765":

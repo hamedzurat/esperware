@@ -14,7 +14,7 @@
   .main { display: grid; grid-template-columns: 280px 1fr; flex: 1; min-height: 0; }
   aside { border-right: 1px solid #2a2f3a; overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
   section { overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
-  .vitem { padding: 7px 8px; border: 1px solid #252a34; border-radius: 4px; cursor: pointer; background: #161920; }
+  .vitem { display: block; width: 100%; padding: 7px 8px; border: 1px solid #252a34; border-radius: 4px; text-align: left; background: #161920; }
   .vitem.active { border-color: #88c0d0; background: #1d2430; }
   .muted { color: #8b94a5; font-size: 11px; }
   .tabs { display: flex; gap: 8px; align-items: center; border-bottom: 1px solid #2a2f3a; padding-bottom: 8px; }
@@ -25,7 +25,7 @@
   .diff-add { color: #a3be8c; }
   .diff-del { color: #bf616a; }
   .diff-hunk { color: #88c0d0; }
-  .fn-row { padding: 4px 6px; border-bottom: 1px solid #20242d; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+  .fn-row { display: block; width: 100%; padding: 4px 6px; text-align: left; }
   .fn-row:hover { background: #1c2029; }
 </style>
 </head>
@@ -36,10 +36,13 @@
   <span class="badge" id="verBadge">v-</span>
   <span class="muted" id="metaInfo"></span>
   <span class="muted" id="mcpUrls"></span>
-  <label class="muted" style="margin-left:auto">Port / URL:
+  <label class="muted" style="margin-left:auto">Port / URL
     <input id="targetInput" size="22" placeholder="8765 or http://127.0.0.1:8765">
-    <button onclick="connectTarget()">Connect</button>
   </label>
+  <label class="muted">Read token
+    <input id="tokenInput" type="password" size="14" autocomplete="off">
+  </label>
+  <button onclick="connectTarget()">Connect</button>
 </header>
 <div class="main">
   <aside>
@@ -48,7 +51,7 @@
       <input id="fromVer" type="number" min="0" value="0" style="width:54px">
       <span class="muted">→</span>
       <input id="toVer" type="number" min="0" value="0" style="width:54px">
-      <button onclick="loadRangeDiff()">Diff</button>
+      <button onclick="loadRangeDiff().catch(reportRequestError)">Diff</button>
     </div>
     <div id="versionList"></div>
   </aside>
@@ -62,37 +65,82 @@
     <div id="fnView" style="display:none;gap:10px;flex-direction:column">
       <input id="fnFilter" placeholder="Filter functions..." oninput="loadFunctions()">
       <div id="fnList" style="max-height:220px;overflow:auto;border:1px solid #252a34;border-radius:4px"></div>
+      <button id="moreFunctions" onclick="loadFunctions(true)" hidden>Load more</button>
+      <span id="fnError" class="muted" role="status"></span>
       <pre id="fnCode">Select a function...</pre>
     </div>
   </section>
 </div>
 <script>
 const STORAGE_KEY = 'ghidramcp.target';
-let selectedVer = null, sse = null;
+let selectedVer = null, connection = null;
+let functionCursor = null, functionRequest = 0;
 
 function normalizeTarget(raw) {
   const s = (raw || '').trim();
   if (!s) return 'http://127.0.0.1:8765';
   if (/^\d+$/.test(s)) return `http://127.0.0.1:${s}`;
-  return s.replace(/\/+$/, '');
+  const url = new URL(s);
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error('Enter a port or an HTTP server URL.');
+  }
+  url.pathname = url.pathname.replace(/\/mcp\/(?:ro|rw)\/?$/, '');
+  return url.href.replace(/\/+$/, '');
 }
 
 const params = new URLSearchParams(location.search);
 const initialRaw = params.get('port') || params.get('api') || localStorage.getItem(STORAGE_KEY) || '8765';
-let apiBase = normalizeTarget(initialRaw);
+let apiBase, readToken;
 const targetInput = document.getElementById('targetInput');
 targetInput.value = initialRaw;
-targetInput.addEventListener('keydown', e => { if (e.key === 'Enter') connectTarget(); });
+const tokenInput = document.getElementById('tokenInput');
+for (const input of [targetInput, tokenInput]) {
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') connectTarget(); });
+}
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const api = p => apiBase + p;
+async function fetchApi(path) {
+  const headers = readToken ? {Authorization: 'Bearer ' + readToken} : {};
+  const response = await fetch(apiBase + path, {headers, signal: connection.signal, redirect: 'error'});
+  if (!response.ok) {
+    let message = 'HTTP ' + response.status;
+    if (response.status === 401) {
+      message = 'Enter a valid read token.';
+    } else if (response.headers.get('Content-Type')?.includes('application/json')) {
+      const body = await response.json();
+      message = body.error || message;
+    }
+    throw Object.assign(new Error(message), {status: response.status});
+  }
+  return response;
+}
+
+function reportRequestError(error) {
+  if (error.name !== 'AbortError') document.getElementById('viewTitle').textContent = error.message;
+}
 
 function connectTarget() {
-  const raw = targetInput.value.trim() || '8765';
-  localStorage.setItem(STORAGE_KEY, raw);
-  apiBase = normalizeTarget(raw);
+  connection?.abort();
+  connection = new AbortController();
   selectedVer = null;
-  boot();
+  functionCursor = null;
+  functionRequest++;
+  document.getElementById('moreFunctions').hidden = true;
+  document.getElementById('fnList').replaceChildren();
+  document.getElementById('fnError').textContent = '';
+  document.getElementById('fnCode').textContent = 'Select a function...';
+  document.getElementById('versionList').replaceChildren();
+  document.getElementById('sseDot').classList.remove('ok');
+  const raw = targetInput.value.trim() || '8765';
+  try {
+    apiBase = normalizeTarget(raw);
+  } catch (error) {
+    showConnectionError(error, raw);
+    return;
+  }
+  localStorage.setItem(STORAGE_KEY, raw);
+  readToken = tokenInput.value;
+  boot(connection.signal);
 }
 
 function showTab(t) {
@@ -114,7 +162,7 @@ function renderDiffText(txt) {
 }
 
 async function loadStatus() {
-  const st = await (await fetch(api('/api/v1/status'))).json();
+  const st = await (await fetchApi('/api/v1/status')).json();
   document.getElementById('binName').textContent = st.binary_name || 'unknown';
   document.getElementById('verBadge').textContent = 'v' + st.version;
   document.getElementById('metaInfo').textContent = `${st.language || ''} | sha256:${(st.binary_sha256||'').slice(0,12)} | ${st.function_count||0} fns`;
@@ -123,20 +171,28 @@ async function loadStatus() {
 }
 
 async function loadVersions() {
-  const data = await (await fetch(api('/api/v1/versions'))).json();
+  const data = await (await fetchApi('/api/v1/versions')).json();
   const list = document.getElementById('versionList');
-  list.innerHTML = data.versions.slice().reverse().map(v => `
-    <div class="vitem ${selectedVer === v.version ? 'active' : ''}" data-v="${v.version}" onclick="selectVersion(${v.version})">
-      <div><strong>v${v.version}</strong> · ${esc(v.operation)} ${v.checkpoint_label ? `<span class="badge">${esc(v.checkpoint_label)}</span>` : ''}</div>
-      <div class="muted">${esc(v.reason || '-')} (${v.ops_count} ops, ${esc(v.actor)})</div>
-    </div>`).join('');
-  if (selectedVer === null && data.versions.length) selectVersion(data.current_version);
+  list.replaceChildren();
+  for (const v of data.versions.slice().reverse()) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'vitem';
+    row.dataset.v = v.version;
+    row.classList.toggle('active', selectedVer === v.version);
+    row.addEventListener('click', () => selectVersion(v.version).catch(reportRequestError));
+    row.innerHTML = `
+      <div><strong>v${esc(v.version)}</strong> · ${esc(v.operation)} ${v.checkpoint_label ? `<span class="badge">${esc(v.checkpoint_label)}</span>` : ''}</div>
+      <div class="muted">${esc(v.reason || '-')} (${esc(v.ops_count)} ops, ${esc(v.actor)})</div>`;
+    list.append(row);
+  }
+  if (selectedVer === null && data.versions.length) await selectVersion(data.current_version);
 }
 
 async function selectVersion(v) {
   selectedVer = v;
   showTab('diff');
-  const data = await (await fetch(api('/api/v1/versions/' + v))).json();
+  const data = await (await fetchApi('/api/v1/versions/' + v)).json();
   const ver = data.version;
   document.getElementById('viewTitle').textContent = `Step v${ver.version} (${ver.operation})`;
   document.getElementById('diffView').innerHTML = `
@@ -149,55 +205,109 @@ async function selectVersion(v) {
 async function loadRangeDiff() {
   showTab('diff');
   const f = document.getElementById('fromVer').value, t = document.getElementById('toVer').value;
-  const data = await (await fetch(api(`/api/v1/diff?from=${f}&to=${t}`))).json();
-  if (!data.ok) {
-    document.getElementById('viewTitle').textContent = `Diff v${f} → v${t} (error)`;
-    document.getElementById('diffView').innerHTML = `<div class="muted">${esc(data.error || 'Failed to load diff.')}</div>`;
-    return;
-  }
+  const data = await (await fetchApi(`/api/v1/diff?from=${f}&to=${t}`)).json();
   document.getElementById('viewTitle').textContent = `Cumulative Diff v${f} → v${t}`;
   document.getElementById('diffView').innerHTML = (data.diffs || []).length
     ? data.diffs.map(d => `<h4>${esc(d.function_name)} (${esc(d.function_address)})</h4>${renderDiffText(d.diff)}`).join('')
     : '<div class="muted">No differences in this range.</div>';
 }
 
-async function loadFunctions() {
-  const q = encodeURIComponent(document.getElementById('fnFilter').value.trim());
-  const data = await (await fetch(api(`/api/v1/functions?limit=100${q ? '&filter=' + q : ''}`))).json();
-  document.getElementById('fnList').innerHTML = (data.functions || []).map(f =>
-    `<div class="fn-row" onclick="loadFn('${esc(f.address)}')"><span>${esc(f.name)}</span><span class="muted">${esc(f.address)} (${f.size}B)</span></div>`
-  ).join('');
+async function loadFunctions(append = false) {
+  const request = ++functionRequest;
+  const list = document.getElementById('fnList');
+  const more = document.getElementById('moreFunctions');
+  const errorLine = document.getElementById('fnError');
+  const query = new URLSearchParams({limit: '100'});
+  const filter = document.getElementById('fnFilter').value.trim();
+  if (filter) query.set('filter', filter);
+  if (append && functionCursor) query.set('cursor', functionCursor);
+  if (!append) {
+    functionCursor = null;
+    list.replaceChildren();
+  }
+  more.disabled = true;
+  errorLine.textContent = '';
+  try {
+    const data = await (await fetchApi('/api/v1/functions?' + query)).json();
+    if (request !== functionRequest) return;
+    if (!data.ok) throw new Error(data.error || 'Failed to load functions.');
+    for (const f of data.functions) {
+      const row = document.createElement('button');
+      row.className = 'fn-row';
+      row.type = 'button';
+      row.textContent = f.name + ' · ' + f.address + ' (' + f.size + 'B)';
+      row.addEventListener('click', () => loadFn(f.address).catch(reportRequestError));
+      list.append(row);
+    }
+    functionCursor = data.next_cursor || null;
+  } catch (error) {
+    if (request === functionRequest) errorLine.textContent = error.message;
+  } finally {
+    if (request === functionRequest) {
+      more.hidden = !functionCursor;
+      more.disabled = false;
+    }
+  }
 }
 
 async function loadFn(addr) {
-  const data = await (await fetch(api('/api/v1/functions/' + encodeURIComponent(addr)))).json();
+  const data = await (await fetchApi('/api/v1/functions/' + encodeURIComponent(addr))).json();
   document.getElementById('viewTitle').textContent = `${data.function.name} @ ${data.function.address} (v${data.version})`;
   document.getElementById('fnCode').textContent = data.pseudocode || data.decompile_error || '(empty)';
 }
 
-function connectSse() {
-  if (sse) sse.close();
-  sse = new EventSource(api('/api/v1/events'));
+async function connectSse(signal) {
   const dot = document.getElementById('sseDot');
-  sse.onopen = () => dot.classList.add('ok');
-  sse.onerror = () => dot.classList.remove('ok');
-  ['version_created', 'checkpoint_saved'].forEach(ev => sse.addEventListener(ev, () => { loadStatus(); loadVersions(); }));
-}
-
-async function boot() {
+  let retry = true;
+  let reader;
   try {
-    await loadStatus();
-    await loadVersions();
-    connectSse();
-  } catch (err) {
-    document.getElementById('sseDot').classList.remove('ok');
-    document.getElementById('binName').textContent = 'unreachable';
-    document.getElementById('verBadge').textContent = 'v-';
-    document.getElementById('metaInfo').textContent = apiBase;
-    document.getElementById('diffView').innerHTML = `<div class="muted">Cannot reach ${esc(apiBase)} (${esc(err.message || err)}). Enter Ghidra port and click Connect.</div>`;
+    const response = await fetchApi('/api/v1/events');
+    dot.classList.add('ok');
+    const decoder = new TextDecoder();
+    reader = response.body.getReader();
+    let buffer = '';
+    while (!signal.aborted) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop();
+      if (frames.some(frame => /^event: (status|version_created|checkpoint_saved)\n/.test(frame))) {
+        await Promise.all([loadStatus(), loadVersions()]);
+      }
+    }
+  } catch (error) {
+    if (!signal.aborted && (error.status === 401 || error.status === 403)) {
+      retry = false;
+      reportRequestError(error);
+    }
+  } finally {
+    if (reader) await reader.cancel().catch(() => {});
+    if (!signal.aborted) {
+      dot.classList.remove('ok');
+      if (retry) setTimeout(() => { if (!signal.aborted) connectSse(signal); }, 2000);
+    }
   }
 }
-boot();
+
+function showConnectionError(error, target) {
+  document.getElementById('binName').textContent = 'unreachable';
+  document.getElementById('verBadge').textContent = 'v-';
+  document.getElementById('metaInfo').textContent = target;
+  document.getElementById('diffView').textContent = error.message;
+}
+
+async function boot(signal) {
+  try {
+    await loadStatus();
+    if (signal.aborted) return;
+    await loadVersions();
+    if (!signal.aborted) connectSse(signal);
+  } catch (error) {
+    if (!signal.aborted) showConnectionError(error, apiBase);
+  }
+}
+connectTarget();
 </script>
 </body>
 </html>

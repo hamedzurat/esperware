@@ -7,24 +7,18 @@ import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.server.McpSyncServer;
 import io.modelcontextprotocol.server.McpSyncServerExchange;
 import io.modelcontextprotocol.server.transport.HttpServletStreamableServerTransportProvider;
-import io.modelcontextprotocol.server.transport.ServerTransportSecurityException;
-import io.modelcontextprotocol.server.transport.ServerTransportSecurityValidator;
 import io.modelcontextprotocol.spec.McpSchema;
-import java.net.InetAddress;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.BiFunction;
 
 /** Builds /mcp/rw (13 tools) and /mcp/ro (9 read-only tools) Streamable HTTP endpoints. */
 final class McpEndpoints implements AutoCloseable {
     private static final String SERVER_NAME = "ghidraMCP";
     private static final String SERVER_VERSION = "0.2.0";
-    private static final Set<String> LOOPBACK_HOSTS = Set.of("127.0.0.1", "localhost", "::1", "[::1]");
 
     record ToolDef(
             McpSchema.Tool tool,
@@ -35,22 +29,19 @@ final class McpEndpoints implements AutoCloseable {
     private final McpSyncServer rwServer;
     private final McpSyncServer roServer;
 
-    McpEndpoints(InspectService inspect, EditService edit, String bindHost, String corsOrigin) {
-        ServerTransportSecurityValidator validator = securityValidator(bindHost, corsOrigin);
+    McpEndpoints(InspectService inspect, EditService edit) {
         var mapper = McpJsonDefaults.getMapper();
 
         rwTransport = HttpServletStreamableServerTransportProvider.builder()
                 .jsonMapper(mapper)
                 .mcpEndpoint("/mcp/rw")
                 .keepAliveInterval(Duration.ofSeconds(30))
-                .securityValidator(validator)
                 .build();
 
         roTransport = HttpServletStreamableServerTransportProvider.builder()
                 .jsonMapper(mapper)
                 .mcpEndpoint("/mcp/ro")
                 .keepAliveInterval(Duration.ofSeconds(30))
-                .securityValidator(validator)
                 .build();
 
         rwServer = buildServer(rwTransport, ApiError.AccessMode.READ_WRITE, inspect, edit);
@@ -226,7 +217,7 @@ final class McpEndpoints implements AutoCloseable {
                     writeAnn, gson, (ex, args) -> edit.revert(mode, actorName(ex), args)));
 
             defs.add(def("save_checkpoint",
-                    "Flush the Ghidra project to disk and tag the current version with an optional checkpoint label.",
+                    "Label the current saved version with an optional checkpoint name.",
                     schema(List.of(), Map.of(
                             "label", strProp("Optional checkpoint label shown in version history and WebUI."))),
                     saveAnn, gson, (ex, args) -> edit.saveCheckpoint(mode, actorName(ex), args)));
@@ -312,60 +303,6 @@ final class McpEndpoints implements AutoCloseable {
 
     private static Map<String, Object> enumProp(String description, String... values) {
         return Map.of("type", "string", "description", description, "enum", List.of(values));
-    }
-
-    static ServerTransportSecurityValidator securityValidator(String bindHost, String corsOrigin) {
-        String normalizedBind = bindHost == null ? "127.0.0.1" : bindHost.toLowerCase(Locale.ROOT);
-        boolean wildcardBind = "0.0.0.0".equals(normalizedBind) || "::".equals(normalizedBind);
-        return headers -> {
-            String host = firstHeader(headers, "Host");
-            if (host == null || host.isBlank()) {
-                throw new ServerTransportSecurityException(421, "Missing Host header");
-            }
-            String hostName = stripPort(host).toLowerCase(Locale.ROOT);
-            if (!wildcardBind && !LOOPBACK_HOSTS.contains(hostName) && !hostName.equals(normalizedBind)) {
-                throw new ServerTransportSecurityException(403, "Rejected Host header: " + host);
-            }
-            String origin = firstHeader(headers, "Origin");
-            if (origin != null && !origin.isBlank() && !isAllowedOrigin(origin, normalizedBind, corsOrigin)) {
-                throw new ServerTransportSecurityException(403, "Rejected Origin header: " + origin);
-            }
-        };
-    }
-
-    private static boolean isAllowedOrigin(String origin, String bindHost, String corsOrigin) {
-        if ("*".equals(corsOrigin)) return true;
-        if (corsOrigin != null && corsOrigin.equalsIgnoreCase(origin)) return true;
-        try {
-            var uri = java.net.URI.create(origin);
-            String h = uri.getHost();
-            if (h == null) return false;
-            String lower = h.toLowerCase(Locale.ROOT);
-            return LOOPBACK_HOSTS.contains(lower)
-                    || lower.equals(bindHost)
-                    || InetAddress.getByName(lower).isLoopbackAddress();
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    private static String firstHeader(Map<String, List<String>> headers, String name) {
-        if (headers == null) return null;
-        for (Map.Entry<String, List<String>> e : headers.entrySet()) {
-            if (e.getKey() != null && e.getKey().equalsIgnoreCase(name) && e.getValue() != null && !e.getValue().isEmpty()) {
-                return e.getValue().getFirst();
-            }
-        }
-        return null;
-    }
-
-    private static String stripPort(String hostHeader) {
-        if (hostHeader.startsWith("[")) {
-            int close = hostHeader.indexOf(']');
-            return close > 0 ? hostHeader.substring(0, close + 1) : hostHeader;
-        }
-        int colon = hostHeader.indexOf(':');
-        return colon >= 0 ? hostHeader.substring(0, colon) : hostHeader;
     }
 
     @Override

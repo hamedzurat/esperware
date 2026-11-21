@@ -8,21 +8,22 @@ import ghidra.framework.HeadlessGhidraApplicationConfiguration;
 import ghidra.util.Msg;
 import jakarta.servlet.DispatcherType;
 import jakarta.servlet.Filter;
-import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletConfig;
 import jakarta.servlet.ServletException;
-import jakarta.servlet.ServletRequest;
-import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
+import java.net.URI;
+import java.security.MessageDigest;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Set;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -34,6 +35,9 @@ import org.eclipse.jetty.server.ServerConnector;
 
 /** Headless Ghidra entry point hosting /mcp/rw, /mcp/ro, and /api/v1/* on one Jetty port. */
 public final class GhidraMcpLauncher implements GhidraLaunchable {
+    private static final Set<String> LOOPBACK_HOSTS = Set.of("127.0.0.1", "localhost", "::1");
+    private static final Set<String> WILDCARD_HOSTS = Set.of("0.0.0.0", "::");
+
     public GhidraMcpLauncher() {}
 
     @Override
@@ -45,7 +49,7 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
 
         ProxyServlet rwProxy = new ProxyServlet();
         ProxyServlet roProxy = new ProxyServlet();
-        WebApiServlet webApi = new WebApiServlet(cfg.corsOrigin);
+        WebApiServlet webApi = new WebApiServlet();
 
         Server jetty = new Server();
         ServerConnector connector = new ServerConnector(jetty);
@@ -67,16 +71,20 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
         apiHolder.setAsyncSupported(true);
         ctx.addServlet(apiHolder, "/");
 
-        if (cfg.rwToken != null || cfg.roToken != null) {
-            ctx.addFilter(new FilterHolder(authFilter(cfg.rwToken, cfg.roToken)), "/*",
-                    EnumSet.of(DispatcherType.REQUEST));
-        }
+        FilterHolder access = new FilterHolder(accessFilter(cfg));
+        access.setAsyncSupported(true);
+        ctx.addFilter(access, "/*", EnumSet.of(DispatcherType.REQUEST));
 
         jetty.setHandler(ctx);
         jetty.setStopTimeout(1000);
         jetty.start();
         int boundPort = connector.getLocalPort();
-        String advertisedHost = "0.0.0.0".equals(cfg.host) ? "127.0.0.1" : cfg.host;
+        String bindHost = normalizeHost(cfg.host);
+        String advertisedHost = switch (bindHost) {
+            case "0.0.0.0" -> "127.0.0.1";
+            case "::" -> "[::1]";
+            default -> bindHost.contains(":") ? "[" + bindHost + "]" : bindHost;
+        };
         String baseUrl = (cfg.publicUrl != null && !cfg.publicUrl.isBlank())
                 ? cfg.publicUrl.replaceAll("/+$", "")
                 : "http://" + advertisedHost + ":" + boundPort;
@@ -116,16 +124,18 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
                     "binary_sha256", ws.binarySha256(),
                     "ghidra_version", ws.ghidraVersion(),
                     "arch", ws.program().getLanguageID().getIdAsString()));
+            store.recover(ws.savedVersion(), ws::saveVersion);
+            ws.versionPublished();
 
             InspectService inspect = new InspectService(ws, store);
             EditService edit = new EditService(ws, store);
-            McpEndpoints mcp = new McpEndpoints(inspect, edit, cfg.host, cfg.corsOrigin);
+            McpEndpoints mcp = new McpEndpoints(inspect, edit);
             mcpRef.set(mcp);
 
             rwProxy.attach(mcp.rwTransport());
             roProxy.attach(mcp.roTransport());
             webApi.markReady(new WebApiServlet.ReadyContext(
-                    ws, store, inspect, baseUrl + "/mcp/rw", baseUrl + "/mcp/ro", shutdownTrigger));
+                    store, inspect, baseUrl + "/mcp/rw", baseUrl + "/mcp/ro", shutdownTrigger, ws::recoveryRequired));
 
             Map<String, Object> ready = new LinkedHashMap<>();
             ready.put("status", "ready");
@@ -153,25 +163,54 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
         System.exit(0);
     }
 
-    private static Filter authFilter(String rwToken, String roToken) {
-        return (ServletRequest request, ServletResponse response, FilterChain chain) -> {
+    private static Filter accessFilter(Config cfg) {
+        URI publicUrl = cfg.publicUrl == null ? null : URI.create(cfg.publicUrl);
+        String publicHost = publicUrl == null ? null : normalizeHost(publicUrl.getHost());
+        String bindHost = normalizeHost(cfg.host);
+        String publicOrigin = publicUrl == null ? null : publicUrl.getScheme() + "://" + publicUrl.getRawAuthority();
+        return (request, response, chain) -> {
             HttpServletRequest req = (HttpServletRequest) request;
             HttpServletResponse resp = (HttpServletResponse) response;
-            String path = req.getRequestURI();
-            String required = null;
-            boolean allowRwFallback = false;
-            if ("/mcp/rw".equals(path) || ("/api/v1/shutdown".equals(path) && "POST".equalsIgnoreCase(req.getMethod()))) {
-                required = rwToken;
-            } else if ("/mcp/ro".equals(path)) {
-                required = roToken;
-                allowRwFallback = true;
+            URI authority = parseRequestAuthority(req);
+            String hostName = authority == null ? "" : normalizeHost(authority.getHost());
+            if (authority == null || WILDCARD_HOSTS.contains(hostName)
+                    || !(LOOPBACK_HOSTS.contains(hostName) || hostName.equals(bindHost) || hostName.equals(publicHost))) {
+                resp.sendError(403, "Host is not allowed");
+                return;
             }
-            if (required != null) {
+            String origin = req.getHeader("Origin");
+            resp.addHeader("Vary", "Origin");
+            if (origin != null) {
+                String requestOrigin = req.getScheme() + "://" + authority.getRawAuthority();
+                if (!(origin.equalsIgnoreCase(requestOrigin) || origin.equalsIgnoreCase(publicOrigin)
+                        || origin.equalsIgnoreCase(cfg.corsOrigin))) {
+                    resp.sendError(403, "Origin is not allowed");
+                    return;
+                }
+                resp.setHeader("Access-Control-Allow-Origin", origin);
+            }
+
+            String path = req.getServletPath();
+            boolean writeRoute = "/mcp/rw".equals(path) || "/api/v1/shutdown".equals(path);
+            boolean readRoute = "/mcp/ro".equals(path)
+                    || (path.startsWith("/api/v1/") && !"/api/v1/health".equals(path));
+            if (origin != null && (writeRoute || readRoute || "/api/v1/health".equals(path))) {
+                resp.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+                if ("OPTIONS".equals(req.getMethod())) {
+                    resp.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+                    resp.setHeader("Access-Control-Allow-Headers",
+                            "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID");
+                    resp.setStatus(204);
+                    return;
+                }
+            }
+            boolean tokensConfigured = cfg.rwToken != null || cfg.roToken != null;
+            if (tokensConfigured && (writeRoute || readRoute)) {
                 String auth = req.getHeader("Authorization");
                 String token = (auth != null && auth.startsWith("Bearer ")) ? auth.substring(7) : null;
-                boolean ok = required.equals(token) || (allowRwFallback && rwToken != null && rwToken.equals(token));
-                if (!ok) {
+                if (!(tokenMatches(cfg.rwToken, token) || (!writeRoute && tokenMatches(cfg.roToken, token)))) {
                     resp.setStatus(401);
+                    resp.setHeader("WWW-Authenticate", "Bearer");
                     resp.setContentType("application/json");
                     resp.getWriter().write("{\"ok\":false,\"error\":\"Unauthorized\"}");
                     return;
@@ -179,6 +218,32 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             }
             chain.doFilter(request, response);
         };
+    }
+
+    private static URI parseRequestAuthority(HttpServletRequest req) {
+        String host = req.getHeader("Host");
+        if (host == null || host.isBlank()) return null;
+        URI uri;
+        try {
+            uri = URI.create(req.getScheme() + "://" + host);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+        if (uri.getHost() == null || uri.getRawUserInfo() != null || !host.equals(uri.getRawAuthority())) return null;
+        int port = uri.getPort();
+        if (port == -1) port = "https".equals(req.getScheme()) ? 443 : 80;
+        return port > 0 && port <= 65535 && port == req.getServerPort()
+                && normalizeHost(uri.getHost()).equals(normalizeHost(req.getServerName())) ? uri : null;
+    }
+
+    private static String normalizeHost(String host) {
+        if (host.startsWith("[") && host.endsWith("]")) host = host.substring(1, host.length() - 1);
+        return host.toLowerCase(Locale.ROOT);
+    }
+
+    private static boolean tokenMatches(String expected, String presented) {
+        return expected != null && presented != null && MessageDigest.isEqual(
+                expected.getBytes(StandardCharsets.UTF_8), presented.getBytes(StandardCharsets.UTF_8));
     }
 
     private static void writeAtomically(Path target, String content) throws IOException {
@@ -261,6 +326,28 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
                 throw new IllegalArgumentException("--work-dir is required");
             }
             if (noCache) cacheDir = null;
+            if (publicUrl != null) {
+                publicUrl = publicUrl.strip();
+                if (publicUrl.isEmpty()) {
+                    publicUrl = null;
+                } else {
+                    URI url = URI.create(publicUrl);
+                    if (!("http".equalsIgnoreCase(url.getScheme()) || "https".equalsIgnoreCase(url.getScheme()))
+                            || url.getHost() == null || url.getRawUserInfo() != null
+                            || url.getRawQuery() != null || url.getRawFragment() != null
+                            || url.getPort() == 0 || url.getPort() > 65535) {
+                        throw new IllegalArgumentException("--public-url must be an HTTP or HTTPS URL with a host");
+                    }
+                }
+            }
+            if (corsOrigin != null) {
+                corsOrigin = corsOrigin.strip();
+                if (corsOrigin.isEmpty()) corsOrigin = null;
+            }
+            if ("*".equals(corsOrigin)) throw new IllegalArgumentException("--cors-origin must name one viewer origin");
+            if (rwToken != null && rwToken.isBlank() || roToken != null && roToken.isBlank()) {
+                throw new IllegalArgumentException("Configured bearer tokens must be non-empty");
+            }
             return new Config(binary, workDir, cacheDir, host, port, publicUrl, corsOrigin, poolSize, rwToken, roToken);
         }
 
