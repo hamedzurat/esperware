@@ -4,7 +4,7 @@ Headless Ghidra 12.2 MCP server with versioned edits, read-only subagent endpoin
 
 ## Repository layout
 
-- `justfile`: shortcut commands to run, inspect, and stop binary containers and open the WebUI.
+- `justfile`: shortcut commands to run, inspect, and stop binary containers and serve the WebUI.
 - `ghidraMCP/`: headless Java Ghidra server, container build, and JUnit 5 test suite. See [the architecture notes](ghidraMCP/README.md) for internals.
 - `wui/`: SvelteKit static WebUI for version scrubbing, unified diffs, function inspection, symbol and type lookup, code search, and memory dumps.
 - `artifacts/`: C test sources and a `justfile` that builds `-O1` stripped and unstripped ELF binaries into `artifacts/build/`.
@@ -47,7 +47,7 @@ just ps                        # List running ghidra-mcp containers
 just logs <port>               # View container logs
 just stop <port>               # Graceful shutdown
 just resume /tmp/my-run <port> # Reopen existing project and version history
-just wui [port] [ui_port]      # Open the WebUI and connect to <port>, default UI port 4173
+just wui [port] [ui_port]      # Serve the WebUI and print its URL for <port>, default UI port 4173
 just dump ./artifacts/build/readability-fixture.unstripped.elf /tmp/my-dump  # Export the current version to <dir>/run/code/v<N>
 ```
 
@@ -55,7 +55,7 @@ A new workspace exports `v0`. An existing workspace exports its current version.
 
 To export from a running server, send `POST /api/v1/export`. The server writes to `<work-dir>/code/v<current_version>/`. If tokens are configured, use the write token.
 
-Install Bun to run `just wui`. The [WebUI](wui/) is a SvelteKit static app that connects directly to the server's REST and SSE endpoints. Run `just wui [port] [ui_port]` to build `wui/` if needed, serve it at `http://127.0.0.1:4173`, and open your browser. If that UI port is already serving, `just wui <port>` opens a new tab so you can inspect multiple servers at once.
+Install Bun to run `just wui`. The [WebUI](wui/) is a SvelteKit static app that connects directly to the server's REST and SSE endpoints. Run `just wui [port] [ui_port]` to build `wui/` if needed, serve it at `http://127.0.0.1:4173`, and print the URL. If that UI port is already serving, `just wui <port>` prints the URL for that server so you can open it in another tab.
 
 Each tab stores its server target and view state in URL query parameters such as `port`, `api`, `tab`, and `fn`. Reloading restores the active view. Use the footer server switcher to change targets or open another server in a new tab. Because `just run` and `just resume` default `GHIDRA_MCP_CORS_ORIGIN` to `loopback`, the local WebUI connects without extra flags. If you host the WebUI on a different origin, set `GHIDRA_MCP_CORS_ORIGIN` when you start the container. Enter a server port, base URL, or MCP URL in the UI. Add a read or write bearer token if the server requires tokens.
 

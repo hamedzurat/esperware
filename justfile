@@ -164,7 +164,7 @@ ps:
 logs port="8765":
     @{{engine}} logs "ghidra-mcp-{{port}}"
 
-# Build (if needed) and open the WebUI, optionally connected to <port>
+# Build (if needed) and serve the WebUI, optionally printing a URL for <port>
 wui port="" ui_port="4173":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -175,27 +175,15 @@ wui port="" ui_port="4173":
     if [ -n "$server_port" ]; then
         url="$url/?port=$server_port"
     fi
-    open_browser() {
-        command -v xdg-open >/dev/null 2>&1 && xdg-open "$url" >/dev/null 2>&1 &
-    }
     if curl -fsS --max-time 1 "http://127.0.0.1:$ui_port/" >/dev/null 2>&1; then
-        echo "Opening $url"
-        open_browser
+        echo "WebUI already running: $url"
         exit 0
     fi
-    [ -d "$wui_dir/node_modules" ] || bun --cwd "$wui_dir" install
-    [ -f "$wui_dir/build/index.html" ] || bun --cwd "$wui_dir" run build
-    (
-        for _ in $(seq 1 40); do
-            if curl -fsS --max-time 1 "http://127.0.0.1:$ui_port/" >/dev/null 2>&1; then
-                open_browser
-                exit 0
-            fi
-            sleep 0.1
-        done
-    ) &
+    cd "$wui_dir"
+    [ -d node_modules ] || bun install
+    [ -f build/index.html ] || bun run build
     echo "Serving WebUI at $url"
-    exec bun --cwd "$wui_dir" run preview -- --host 127.0.0.1 --port "$ui_port" --strictPort
+    exec bun run preview -- --host 127.0.0.1 --port "$ui_port" --strictPort
 
 # Build all C test binaries in artifacts/
 artifacts:
