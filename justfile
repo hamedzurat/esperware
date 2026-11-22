@@ -6,24 +6,25 @@ image := env_var_or_default("MCP_IMAGE", "ghidra-mcp:local")
 default:
     @just --list
 
-# Start one headless Ghidra MCP container: just run <binary> [port] [dir]
-run binary port="8765" dir="":
+# Start one headless Ghidra MCP container: just run <binary> [dir]
+run binary dir="":
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{invocation_directory()}}"
     bin_abs="$(realpath "{{binary}}")"
     [ -f "$bin_abs" ] || { echo "Binary not found: $bin_abs" >&2; exit 2; }
+    bin_name="$(basename "$bin_abs")"
     dir_arg="{{dir}}"
-    if [ -z "$dir_arg" ]; then dir_arg="/tmp/esperware-{{port}}"; fi
+    if [ -z "$dir_arg" ]; then dir_arg="/tmp/esperware-$(date +%s%N)-${bin_name%.*}"; fi
     dir_abs="$(realpath -m "$dir_arg")"
     case "/$dir_abs" in */.*) echo "State dir cannot contain '.'-prefixed segments: $dir_abs" >&2; exit 2 ;; esac
     mkdir -p "$dir_abs/run" "$dir_abs/cache"
     rm -f "$dir_abs/run/ready.json"
-    bin_name="$(basename "$bin_abs")"
-    cname="ghidra-mcp-{{port}}"
+    port="$(python3 -c $'import socket\nfor port in range(32001, 65536):\n    with socket.socket() as s:\n        try:\n            s.bind(("127.0.0.1", port))\n            print(port)\n            break\n        except OSError:\n            pass\nelse:\n    raise SystemExit("No free port above 32000")')"
+    cname="ghidra-mcp-$port"
     {{engine}} run --rm -d --name "$cname" \
-      -p "127.0.0.1:{{port}}:8765" \
-      -e "GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:{{port}}" \
+      -p "127.0.0.1:$port:8765" \
+      -e "GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:$port" \
       -e GHIDRA_MCP_CORS_ORIGIN \
       -v "$bin_abs:/input/$bin_name:ro" \
       -v "$dir_abs:/data" \
@@ -31,6 +32,7 @@ run binary port="8765" dir="":
       --binary "/input/$bin_name" --work-dir /data/run --cache-dir /data/cache >/dev/null
     for _ in $(seq 1 240); do
       if [ -f "$dir_abs/run/ready.json" ]; then
+        echo "Started on port $port (state: $dir_abs)" >&2
         cat "$dir_abs/run/ready.json"
         exit 0
       fi
@@ -40,7 +42,7 @@ run binary port="8765" dir="":
       fi
       sleep 0.25
     done
-    echo "Timed out waiting for $dir_abs/run/ready.json; check: just logs {{port}}" >&2
+    echo "Timed out waiting for $dir_abs/run/ready.json; check: just logs $port" >&2
     exit 1
 
 # Resume an existing state directory without re-importing a binary
@@ -103,7 +105,7 @@ logs port="8765":
     @{{engine}} logs "ghidra-mcp-{{port}}"
 
 # Open standalone WebUI pointed at port
-wui port="8765":
+wui port:
     @xdg-open "file://{{justfile_directory()}}/wui/index.html?port={{port}}" >/dev/null 2>&1 &
 
 # Build all C test binaries in artifacts/

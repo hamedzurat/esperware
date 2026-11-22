@@ -37,7 +37,7 @@
   <span class="muted" id="metaInfo"></span>
   <span class="muted" id="mcpUrls"></span>
   <label class="muted" style="margin-left:auto">Port / URL
-    <input id="targetInput" size="22" placeholder="8765 or http://127.0.0.1:8765">
+    <input id="targetInput" size="22" placeholder="Enter the server port or URL">
   </label>
   <label class="muted">Read token
     <input id="tokenInput" type="password" size="14" autocomplete="off">
@@ -78,7 +78,7 @@ let functionCursor = null, functionRequest = 0;
 
 function normalizeTarget(raw) {
   const s = (raw || '').trim();
-  if (!s) return 'http://127.0.0.1:8765';
+  if (!s) throw new Error('Enter the server port or URL.');
   if (/^\d+$/.test(s)) return `http://127.0.0.1:${s}`;
   const url = new URL(s);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
@@ -89,7 +89,7 @@ function normalizeTarget(raw) {
 }
 
 const params = new URLSearchParams(location.search);
-const initialRaw = params.get('port') || params.get('api') || localStorage.getItem(STORAGE_KEY) || '8765';
+const initialRaw = params.get('port') || params.get('api') || localStorage.getItem(STORAGE_KEY) || '';
 let apiBase, readToken;
 const targetInput = document.getElementById('targetInput');
 targetInput.value = initialRaw;
@@ -131,7 +131,7 @@ function connectTarget() {
   document.getElementById('fnCode').textContent = 'Select a function...';
   document.getElementById('versionList').replaceChildren();
   document.getElementById('sseDot').classList.remove('ok');
-  const raw = targetInput.value.trim() || '8765';
+  const raw = targetInput.value.trim();
   try {
     apiBase = normalizeTarget(raw);
   } catch (error) {

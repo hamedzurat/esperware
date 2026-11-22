@@ -27,29 +27,30 @@ Build the container image once:
 just image
 ```
 
-Start the server by pointing at a binary, port (default `8765`), and state directory (default `/tmp/esperware-<port>`):
+Start a server with a binary. The recipe chooses a free port above `32000` and prints it when the server is ready:
 
 ```sh
-just run ./artifacts/build/readability-fixture.stripped.elf 8765 /tmp/my-run
+just run ./artifacts/build/readability-fixture.stripped.elf
 ```
 
-`just run` creates `/tmp/my-run/run` (project and SQLite history) and `/tmp/my-run/cache` (SHA-256 baseline cache), starts the container, waits until ready, and prints the endpoints:
-
-- Main agent (read-write, 13 tools): `http://127.0.0.1:8765/mcp/rw`
-- Subagents (read-only, 9 tools): `http://127.0.0.1:8765/mcp/ro`
-- REST and SSE API: `http://127.0.0.1:8765/api/v1`
-
-The [standalone WUI](wui/index.html) reads the server's REST and event APIs. To open it from disk, set `GHIDRA_MCP_CORS_ORIGIN=null` when you start the container with `just run` or `just resume`. Then run `just wui 8765`. If you host the WUI separately over HTTP, set the server's allowed origin to the WUI's scheme, hostname, and port. Enter the target server's port, base URL, or MCP endpoint URL in the WUI. If you configured tokens, enter the read token there.
-
-Manage running containers with:
+By default, `just run` stores the project and SQLite history in `/tmp/esperware-<time>-readability-fixture.stripped/run`. It stores the SHA-256 baseline cache in the matching `cache` directory. Pass a directory as the second argument to choose a different state directory:
 
 ```sh
-just status 8765              # Query live binary metadata and current version
-just ps                       # List running ghidra-mcp containers
-just logs 8765                # View container logs
-just stop 8765                # Graceful shutdown
-just resume /tmp/my-run 8765  # Reopen existing project and version history
+just run ./artifacts/build/readability-fixture.stripped.elf /tmp/my-run
 ```
+
+The readiness output contains the server endpoints. Each run gets its own port and container name, so you can run multiple binaries at once. Use the reported port with the management commands:
+
+```sh
+just status <port>             # Query live binary metadata and current version
+just ps                        # List running ghidra-mcp containers
+just logs <port>               # View container logs
+just stop <port>               # Graceful shutdown
+just resume /tmp/my-run <port> # Reopen existing project and version history
+just wui <port>                # Open the standalone viewer for this server
+```
+
+The [standalone WUI](wui/index.html) reads the server's REST and event APIs. To open it from disk, set `GHIDRA_MCP_CORS_ORIGIN=null` when you start the container with `just run` or `just resume`. If you host the WUI separately over HTTP, set the server's allowed origin to the WUI's scheme, hostname, and port. Enter the target server's port, base URL, or MCP endpoint URL in the WUI. If you configured tokens, enter the read token there.
 
 Pass `CONTAINER_ENGINE=docker` before any `just` command to use Docker instead of Podman.
 
