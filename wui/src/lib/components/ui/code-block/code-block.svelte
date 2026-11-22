@@ -1,0 +1,462 @@
+<script lang="ts">
+  import CheckIcon from '@lucide/svelte/icons/check';
+  import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
+  import CopyIcon from '@lucide/svelte/icons/copy';
+  import DownloadIcon from '@lucide/svelte/icons/download';
+  import Badge from '#lib/components/ui/badge/badge.svelte';
+  import Button from '#lib/components/ui/button/button.svelte';
+  import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.ts';
+  import Spinner from '#lib/components/ui/spinner/spinner.svelte';
+  import { cn, type Color, type WithElementRef } from '#lib/utils.ts';
+  import { mode, userPrefersMode } from 'mode-watcher';
+  import type { Component, Snippet } from 'svelte';
+  import type { HTMLAttributes } from 'svelte/elements';
+  import { fade } from 'svelte/transition';
+
+  import '@shikijs/magic-move/style.css';
+
+  import CodeBlockBody from './code-block-body.svelte';
+  import { DEFAULT_VARIANT_KEY, getKeyedVariant, setKeyedVariant } from './code-block-store.svelte.ts';
+  import {
+    displayHeight,
+    effectiveLineLimit,
+    hasTruncatedLines,
+    initialViewMode,
+    isClickToExpand,
+    showBodyContent,
+    toggleHeaderCollapse,
+    type ViewMode,
+  } from './code-block-view.ts';
+  import type { CodeBlockShikiConfig, CodeBlockVariant } from './code-block.types.ts';
+  import { resolveCodeTheme, resolveLangAlias, resolveThemeAlias } from './shiki.ts';
+
+  type PaletteColor = Color;
+  type Variant = { value: string; label: string; code: string };
+
+  let {
+    ref = $bindable(null),
+    class: className,
+    color,
+    headerColor,
+    code: singleCode,
+    lang,
+    html: preHighlightedHtml,
+    title,
+    icon: IconComponent,
+    copy = false,
+    download,
+    numbered = false,
+    wrap = false,
+    showHeader = true,
+    lines,
+    highlightedLines,
+    tabSize = 2,
+    theme,
+    lightTheme,
+    darkTheme,
+    shiki,
+    themes: themesProp,
+    langs: langsProp,
+    defaultVariant,
+    variantKey = DEFAULT_VARIANT_KEY,
+    variants: variantInputs = [],
+    actions,
+    ...restProps
+  }: WithElementRef<HTMLAttributes<HTMLDivElement>> & {
+    color: PaletteColor;
+    headerColor: PaletteColor;
+    code?: string;
+    lang?: string;
+    html?: string;
+    title?: string;
+    icon?: Component;
+    copy?: boolean;
+    download?: string | boolean;
+    numbered?: boolean;
+    wrap?: boolean;
+    showHeader?: boolean;
+    lines?: number;
+    highlightedLines?: number[];
+    tabSize?: number;
+    theme?: string;
+    lightTheme?: string;
+    darkTheme?: string;
+    shiki?: CodeBlockShikiConfig;
+    themes?: string[];
+    langs?: string[];
+    defaultVariant?: string;
+    variantKey?: string;
+    variants?: CodeBlockVariant[];
+    actions?: Snippet;
+  } = $props();
+
+  const themes = $derived(shiki?.themes ?? themesProp ?? []);
+  const langs = $derived(shiki?.langs ?? langsProp ?? []);
+  const resolvedLightTheme = $derived(lightTheme ?? shiki?.lightTheme);
+  const resolvedDarkTheme = $derived(darkTheme ?? shiki?.darkTheme);
+  const showDownload = $derived(download !== undefined && download !== false);
+  const downloadFilename = $derived(typeof download === 'string' ? download : title || `code.${lang || 'txt'}`);
+  const variants = $derived(variantInputs.map(normalizeVariant));
+
+  let activeValue = $state('');
+  let codeColors = $state<{ bg: string; fg: string } | null>(null);
+  let fullBodyHeight = $state<number>();
+  let limitedBodyElement = $state<HTMLDivElement | null>(null);
+  let viewMode = $state<ViewMode>('full');
+  let hasExpanded = $state(false);
+  let copied = $state(false);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const activeMode = $derived.by((): 'light' | 'dark' => {
+    const derived = mode.current;
+    if (derived === 'light' || derived === 'dark') return derived;
+    const preferred = userPrefersMode.current;
+    if (preferred === 'light' || preferred === 'dark') return preferred;
+    return 'dark';
+  });
+  const activeTheme = $derived(
+    resolveCodeTheme({
+      theme,
+      lightTheme: resolvedLightTheme,
+      darkTheme: resolvedDarkTheme,
+      mode: activeMode,
+      loadedThemes: themes,
+    }),
+  );
+
+  const hasVariants = $derived(variants.length > 0);
+  const activeVariant = $derived(variants.find((variant) => variant.value === activeValue) ?? variants[0]);
+  const activeCode = $derived(hasVariants ? (activeVariant?.code ?? '') : (singleCode ?? ''));
+  const normalizedLang = $derived(lang ? resolveLangAlias(lang) : undefined);
+  const hasContent = $derived(!!preHighlightedHtml || activeCode.length > 0);
+  const highlightedLineSet = $derived(highlightedLines?.length ? new Set(highlightedLines) : undefined);
+  const canAnimate = $derived(
+    hasVariants && !highlightedLineSet && !preHighlightedHtml && !!normalizedLang && !!activeTheme,
+  );
+  const resolvedTheme = $derived(activeTheme ? resolveThemeAlias(activeTheme) : '');
+  const missingTheme = $derived(!preHighlightedHtml && !!activeCode && !!normalizedLang && !resolvedTheme);
+  const themeKey = $derived(`${activeMode}:${resolvedTheme}`);
+  const activeVariantLabel = $derived(activeVariant?.label ?? 'Variant');
+  const languageLabel = $derived(!title ? lang : undefined);
+  const totalLines = $derived(activeCode ? activeCode.split('\n').length : 0);
+  const lineLimit = $derived(effectiveLineLimit(viewMode, lines));
+  const truncated = $derived(hasTruncatedLines(viewMode, lines, totalLines));
+  const bodyVisible = $derived(showBodyContent(viewMode, hasContent));
+  const collapseToggle = $derived(hasContent);
+  const maxHeight = $derived(displayHeight(lineLimit));
+  const naturalBodyHeight = $derived(fullBodyHeight ?? Number.parseFloat(displayHeight(totalLines) ?? '48px'));
+  const visibleBodyHeight = $derived(
+    maxHeight ? Math.min(Number.parseFloat(maxHeight), naturalBodyHeight) : naturalBodyHeight,
+  );
+  const clickToExpand = $derived(isClickToExpand(viewMode));
+  const codePreClass = $derived(cn('m-0 p-4 leading-6', !wrap && 'min-w-max', wrap && 'break-all whitespace-pre-wrap'));
+
+  $effect(() => {
+    const element = limitedBodyElement;
+    if (!element) return;
+
+    const updateHeight = () => {
+      fullBodyHeight = element.firstElementChild?.scrollHeight ?? element.scrollHeight;
+    };
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    if (element.firstElementChild) observer.observe(element.firstElementChild);
+    const mutations = new MutationObserver(() => {
+      if (element.firstElementChild) observer.observe(element.firstElementChild);
+      updateHeight();
+    });
+    mutations.observe(element, { childList: true });
+    updateHeight();
+
+    return () => {
+      observer.disconnect();
+      mutations.disconnect();
+    };
+  });
+
+  function normalizeVariant(input: CodeBlockVariant): Variant {
+    return { value: input.value, label: input.label ?? input.value, code: input.code };
+  }
+
+  function chooseInitialVariant(nextVariants: Variant[]): string {
+    const saved = getKeyedVariant(variantKey);
+    const preferred = saved || defaultVariant;
+    if (preferred && nextVariants.some((variant) => variant.value === preferred)) return preferred;
+    return nextVariants[0]?.value ?? '';
+  }
+
+  function selectVariant(value: string) {
+    activeValue = value;
+    setKeyedVariant(value, variantKey);
+  }
+
+  function expandToFull() {
+    viewMode = 'full';
+    hasExpanded = true;
+  }
+
+  function toggleCollapse() {
+    if (viewMode === 'full') hasExpanded = true;
+    const nextViewMode = toggleHeaderCollapse(viewMode, lines, hasExpanded);
+    if (nextViewMode === 'full') hasExpanded = true;
+    viewMode = nextViewMode;
+  }
+
+  function handleBlockClick(event: MouseEvent) {
+    if (!clickToExpand) return;
+    if ((event.target as HTMLElement).closest('button, a, [role="menu"]')) return;
+    expandToFull();
+  }
+
+  $effect(() => {
+    const list = variants;
+    if (!list.length) {
+      activeValue = '';
+      return;
+    }
+    const saved = getKeyedVariant(variantKey);
+    if (saved && list.some((variant) => variant.value === saved)) {
+      activeValue = saved;
+      return;
+    }
+    if (!activeValue || !list.some((variant) => variant.value === activeValue)) {
+      activeValue = chooseInitialVariant(list);
+    }
+  });
+
+  $effect(() => {
+    const initialLines = lines;
+    hasExpanded = false;
+    viewMode = initialViewMode(initialLines);
+  });
+
+  async function handleCopy() {
+    if (!navigator.clipboard || !activeCode) return;
+    try {
+      await navigator.clipboard.writeText(activeCode);
+      copied = true;
+      if (copyTimer) clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => {
+        copied = false;
+      }, 2000);
+    } catch {
+      // Clipboard access can be unavailable in insecure contexts.
+    }
+  }
+
+  function handleDownload() {
+    if (!activeCode) return;
+    const blob = new Blob([activeCode], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = downloadFilename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+</script>
+
+{#snippet limitedBody(content: Snippet)}
+  <div
+    bind:this={limitedBodyElement}
+    class={cn('relative overflow-hidden transition-[max-height] duration-200 ease-in-out', !wrap && 'min-w-max')}
+    style:max-height={maxHeight ?? (fullBodyHeight ? `${fullBodyHeight}px` : undefined)}
+  >
+    {@render content()}
+    {#if truncated}
+      <div
+        transition:fade={{ duration: 150 }}
+        class="neoretro-clr neoretro-border-t bg-clr pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-center py-2"
+        data-color={headerColor}
+      >
+        <span class="text-on-clr font-mono text-xs leading-none font-black tracking-wide uppercase italic">
+          Show {totalLines - lineLimit!} more lines
+        </span>
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet highlightedCode()}
+  <CodeBlockBody
+    code={activeCode}
+    lang={normalizedLang!}
+    theme={resolvedTheme}
+    {themes}
+    {langs}
+    {canAnimate}
+    {numbered}
+    {wrap}
+    {title}
+    {highlightedLines}
+    spinnerColor={color}
+    onColors={(colors) => {
+      codeColors = colors;
+      if (colors) {
+        requestAnimationFrame(() => {
+          if (limitedBodyElement) {
+            fullBodyHeight = limitedBodyElement.firstElementChild?.scrollHeight ?? limitedBodyElement.scrollHeight;
+          }
+        });
+      }
+    }}
+  />
+{/snippet}
+
+<div
+  bind:this={ref}
+  data-slot="code-block"
+  class={cn(
+    'neoretro-shadow neoretro-border bg-background text-foreground overflow-hidden rounded',
+    clickToExpand && 'cursor-pointer',
+    className,
+  )}
+  aria-expanded={collapseToggle ? viewMode !== 'hidden' : undefined}
+  aria-label={truncated ? `Show ${totalLines - lineLimit!} more lines` : undefined}
+  onclick={handleBlockClick}
+  {...restProps}
+>
+  {#if showHeader}
+    <div class="neoretro-clr neoretro-border-b flex min-w-0 items-center gap-2 p-2" data-color={headerColor}>
+      {#if IconComponent}
+        <span class="neoretro-border flex size-7 shrink-0 items-center justify-center rounded">
+          <IconComponent class="size-4" />
+        </span>
+      {/if}
+
+      <div class="flex min-w-0 flex-wrap items-center gap-1.5">
+        {#if missingTheme}
+          <Badge
+            {color}
+            class="text-xs font-black uppercase"
+            title="Provide theme, a mode-specific theme, or a configured Shiki theme."
+          >
+            Theme required
+          </Badge>
+        {:else if !hasContent}
+          <Badge {color} class="text-xs font-black uppercase">No code to display</Badge>
+        {:else if title}
+          <span class="min-w-0 truncate text-sm font-black">{title}</span>
+        {:else if languageLabel}
+          <Badge {color} class="text-xs font-black uppercase">
+            {languageLabel}
+          </Badge>
+        {/if}
+      </div>
+
+      <div class="ml-auto flex shrink-0 items-center gap-1.5">
+        {#if hasVariants}
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger>
+              <Button {color} size="sm" class="h-8 px-2 text-xs">
+                {activeVariantLabel}
+                <ChevronDownIcon class="size-3.5" />
+              </Button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Content {color} align="end" class="min-w-36">
+              <DropdownMenu.RadioGroup value={activeValue} onValueChange={(value) => selectVariant(value)}>
+                {#each variants as variant (variant.value)}
+                  <DropdownMenu.RadioItem value={variant.value}>{variant.label}</DropdownMenu.RadioItem>
+                {/each}
+              </DropdownMenu.RadioGroup>
+            </DropdownMenu.Content>
+          </DropdownMenu.Root>
+        {/if}
+
+        {#if actions}
+          {@render actions()}
+        {/if}
+
+        {#if hasContent && !missingTheme}
+          <Button
+            {color}
+            size="icon-sm"
+            onclick={toggleCollapse}
+            aria-label={viewMode === 'full' || (viewMode === 'lines' && hasExpanded) ? 'Collapse code' : 'Expand code'}
+          >
+            <ChevronDownIcon
+              class={cn(
+                'pointer-events-none size-4 shrink-0 transition-transform duration-200',
+                (viewMode === 'full' || (viewMode === 'lines' && hasExpanded)) && 'rotate-180',
+              )}
+            />
+          </Button>
+        {/if}
+
+        {#if showDownload}
+          <Button {color} size="icon-sm" onclick={handleDownload} aria-label="Download code">
+            <DownloadIcon class="size-4" />
+          </Button>
+        {/if}
+
+        {#if copy}
+          <Button {color} size="icon-sm" onclick={handleCopy} aria-label={copied ? 'Copied' : 'Copy code'}>
+            {#if copied}
+              <CheckIcon class="size-4" />
+            {:else}
+              <CopyIcon class="size-4" />
+            {/if}
+          </Button>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if !missingTheme}
+    <div
+      class="grid overflow-hidden transition-[grid-template-rows] duration-200 ease-in-out"
+      style:grid-template-rows={bodyVisible ? `${visibleBodyHeight}px` : '0px'}
+      aria-hidden={!bodyVisible}
+      inert={!bodyVisible}
+    >
+      <div class="min-h-0 overflow-hidden">
+        <div
+          class="relative overflow-x-auto overflow-y-hidden font-mono text-xs"
+          style:background-color={codeColors?.bg}
+          style:color={codeColors?.fg}
+          style:tab-size={tabSize}
+        >
+          {#if preHighlightedHtml}
+            {#if truncated}
+              {@render limitedBody(preHtml)}
+            {:else}
+              <pre class={codePreClass}>
+                <code>
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                  {@html preHighlightedHtml}
+                </code>
+              </pre>
+            {/if}
+          {:else if activeCode && normalizedLang && resolvedTheme}
+            {#key themeKey}
+              {@render limitedBody(highlightedCode)}
+            {/key}
+          {:else if activeCode && !normalizedLang}
+            {#if truncated}
+              {@render limitedBody(plainBody)}
+            {:else}
+              <pre class={codePreClass}><code>{activeCode}</code></pre>
+            {/if}
+          {:else if activeCode}
+            <div class="bg-background text-foreground flex items-center justify-center p-4">
+              <Spinner {color} />
+            </div>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
+</div>
+
+{#snippet preHtml()}
+  <pre class={codePreClass}>
+    <code>
+      <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+      {@html preHighlightedHtml}
+    </code>
+  </pre>
+{/snippet}
+
+{#snippet plainBody()}
+  <pre class={codePreClass}><code>{activeCode}</code></pre>
+{/snippet}

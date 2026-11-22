@@ -1,12 +1,12 @@
 # Esperware
 
-Headless Ghidra 12.2 MCP server with versioned edits, read-only subagent endpoints, and a standalone diff viewer.
+Headless Ghidra 12.2 MCP server with versioned edits, read-only subagent endpoints, and a SvelteKit WebUI.
 
 ## Repository layout
 
-- `justfile`: shortcut commands to start, inspect, and stop a binary container.
+- `justfile`: shortcut commands to run, inspect, and stop binary containers and open the WebUI.
 - `ghidraMCP/`: headless Java Ghidra server, container build, and JUnit 5 test suite. See [the architecture notes](ghidraMCP/README.md) for internals.
-- `wui/`: standalone browser viewer for versions, unified diffs, and functions.
+- `wui/`: SvelteKit static WebUI for version scrubbing, unified diffs, function inspection, symbol and type lookup, code search, and memory dumps.
 - `artifacts/`: C test sources and a `justfile` that builds `-O1` stripped and unstripped ELF binaries into `artifacts/build/`.
 
 ## Build test binaries
@@ -47,7 +47,7 @@ just ps                        # List running ghidra-mcp containers
 just logs <port>               # View container logs
 just stop <port>               # Graceful shutdown
 just resume /tmp/my-run <port> # Reopen existing project and version history
-just wui <port>                # Open the standalone viewer for this server
+just wui [port] [ui_port]      # Open the WebUI and connect to <port>, default UI port 4173
 just dump ./artifacts/build/readability-fixture.unstripped.elf /tmp/my-dump  # Export the current version to <dir>/run/code/v<N>
 ```
 
@@ -55,7 +55,9 @@ A new workspace exports `v0`. An existing workspace exports its current version.
 
 To export from a running server, send `POST /api/v1/export`. The server writes to `<work-dir>/code/v<current_version>/`. If tokens are configured, use the write token.
 
-The [standalone WUI](wui/index.html) reads the server's REST and event APIs. To open it from disk, set `GHIDRA_MCP_CORS_ORIGIN=null` when you start the container with `just run` or `just resume`. If you host the WUI separately over HTTP, set the server's allowed origin to the WUI's scheme, hostname, and port. Enter the target server's port, base URL, or MCP endpoint URL in the WUI. If you configured tokens, enter the read token there.
+Install Bun to run `just wui`. The [WebUI](wui/) is a SvelteKit static app that connects directly to the server's REST and SSE endpoints. Run `just wui [port] [ui_port]` to build `wui/` if needed, serve it at `http://127.0.0.1:4173`, and open your browser. If that UI port is already serving, `just wui <port>` opens a new tab so you can inspect multiple servers at once.
+
+Each tab stores its server target and view state in URL query parameters such as `port`, `api`, `tab`, and `fn`. Reloading restores the active view. Use the footer server switcher to change targets or open another server in a new tab. Because `just run` and `just resume` default `GHIDRA_MCP_CORS_ORIGIN` to `loopback`, the local WebUI connects without extra flags. If you host the WebUI on a different origin, set `GHIDRA_MCP_CORS_ORIGIN` when you start the container. Enter a server port, base URL, or MCP URL in the UI. Add a read or write bearer token if the server requires tokens.
 
 Pass `CONTAINER_ENGINE=docker` before any `just` command to use Docker instead of Podman.
 
@@ -88,11 +90,11 @@ Passing `--port 0` binds a free ephemeral port and writes the chosen port into `
 | `--port <num>` | `GHIDRA_MCP_PORT` | HTTP port (`0` for ephemeral, default `8765`). |
 | `--public-url <url>` | `GHIDRA_MCP_PUBLIC_URL` | Base URL advertised in `ready.json` and `/api/v1/status`. |
 | `--decompiler-pool <n>` | — | Concurrent `DecompInterface` worker count (default `2`). |
-| `--cors-origin <origin>` | `GHIDRA_MCP_CORS_ORIGIN` | Adds one allowed browser origin. Use `null` if you deliberately open the viewer as a local file. |
+| `--cors-origin <origin>` | `GHIDRA_MCP_CORS_ORIGIN` | Sets allowed browser origins. Accepts one exact origin, `loopback` for any HTTP or HTTPS origin on `127.0.0.1`, `localhost`, or `[::1]`, or `null`. Rejects `*`. Unset by default in `ghidra-mcp`, and defaults to `loopback` in `just run` and `just resume`. |
 | `--rw-token <token>` | `GHIDRA_MCP_RW_TOKEN` | Bearer token for write endpoints, shutdown, and read endpoints. |
 | `--ro-token <token>` | `GHIDRA_MCP_RO_TOKEN` | Bearer token for `/mcp/ro` and the REST inspection and event endpoints. |
 
-When either token is configured, inspection routes require a bearer token and write routes require the write token. You can leave both unset for trusted local use. The standalone WUI requires an allowed browser origin.
+When either token is configured, inspection routes require a bearer token and write routes require the write token. You can leave both unset for trusted local use. The WebUI requires an allowed browser origin.
 
 ## MCP tools
 
@@ -102,13 +104,23 @@ Write tools on `/mcp/rw` only: `apply_edits`, `define_type`, `revert`, and `save
 
 ## Build and test commands
 
-All tests use Java and JUnit 5:
+Server unit and end-to-end tests use Java and JUnit 5:
 
 ```sh
 just --list     # List top-level run and test commands
-just test       # Fast unit tests (VersionStore and access control)
+just test       # Fast Java unit tests for VersionStore and access control
 just e2e        # Container E2E suite using Podman
-just check      # Unit tests and container E2E suite
+just check      # Java unit tests and container E2E suite
 ```
 
-Inside `ghidraMCP/`, `just e2e-local` runs the same E2E suite against the local headless launcher without containers.
+Inside `ghidraMCP/`, run `just e2e-local` to execute the E2E suite against the local headless launcher without containers.
+
+Run WebUI tests, checks, and builds inside `wui/` with Bun:
+
+```sh
+cd wui
+bun test        # Unit tests for API, SSE, address, and URL helpers
+bun run check   # ESLint and svelte-check type checking
+bun run build   # Build the static bundle into wui/build/
+bun run dev     # Start the Vite dev server with hot reload
+```

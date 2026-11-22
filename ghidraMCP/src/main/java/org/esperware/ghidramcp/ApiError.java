@@ -54,6 +54,10 @@ final class ApiError extends RuntimeException {
         if (!(val instanceof Number n)) {
             throw new ApiError("INVALID_ARGUMENT", key + " must be an integer", currentVersion);
         }
+        double d = n.doubleValue();
+        if (!Double.isFinite(d) || Math.rint(d) != d) {
+            throw new ApiError("INVALID_ARGUMENT", key + " must be an integer", currentVersion);
+        }
         return n.longValue();
     }
 
@@ -63,11 +67,15 @@ final class ApiError extends RuntimeException {
         if (!(val instanceof Number n)) {
             throw new ApiError("INVALID_ARGUMENT", key + " must be an integer", null);
         }
-        int v = n.intValue();
+        double d = n.doubleValue();
+        if (!Double.isFinite(d) || Math.rint(d) != d) {
+            throw new ApiError("INVALID_ARGUMENT", key + " must be an integer", null);
+        }
+        long v = n.longValue();
         if (v < min || v > max) {
             throw new ApiError("INVALID_ARGUMENT", key + " must be between " + min + " and " + max, null);
         }
-        return v;
+        return (int) v;
     }
 
     static boolean optBool(Map<String, Object> args, String key, boolean defaultVal) {
@@ -217,8 +225,10 @@ final class ApiError extends RuntimeException {
                     case ADD -> { bCount++; hunk.append('+').append(op.line).append('\n'); }
                 }
             }
-            sb.append("@@ -").append(aStart).append(',').append(aCount)
-                    .append(" +").append(bStart).append(',').append(bCount).append(" @@\n");
+            int hdrAStart = aCount == 0 ? 0 : aStart;
+            int hdrBStart = bCount == 0 ? 0 : bStart;
+            sb.append("@@ -").append(hdrAStart).append(',').append(aCount)
+                    .append(" +").append(hdrBStart).append(',').append(bCount).append(" @@\n");
             sb.append(hunk);
             pos++;
         }

@@ -1,0 +1,39 @@
+<script lang="ts">
+  import { buttonVariants, type ButtonSize } from '#lib/components/ui/button/index.ts';
+  import { cn } from '#lib/utils.ts';
+  import { Pagination as PaginationPrimitive } from 'bits-ui';
+  import { getContext } from 'svelte';
+
+  let {
+    ref = $bindable(null),
+    class: className,
+    size = 'icon',
+    isActive,
+    page,
+    children,
+    ...restProps
+  }: PaginationPrimitive.PageProps & {
+    isActive: boolean;
+    size?: ButtonSize;
+  } = $props();
+
+  const getActiveColor = getContext<() => string>('paginationActiveColor');
+  const getInactiveColor = getContext<() => string>('paginationInactiveColor');
+</script>
+
+{#snippet Fallback()}
+  {page.value}
+{/snippet}
+
+<PaginationPrimitive.Page
+  bind:ref
+  {page}
+  aria-current={isActive ? 'page' : undefined}
+  data-slot="pagination-link"
+  {...isActive ? { tabindex: -1 } : { 'data-pressable': '' }}
+  data-active={isActive}
+  data-color={isActive ? getActiveColor() : getInactiveColor()}
+  class={cn(buttonVariants({ size }), 'neoretro-clr', className)}
+  children={children || Fallback}
+  {...restProps}
+/>

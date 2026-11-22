@@ -617,11 +617,23 @@ final class EditService {
     private List<Map<String, Object>> setGlobalTypeOp(Map<String, Object> op) throws Exception {
         Program p = ws.program();
         String target = ApiError.reqStr(op, "target");
-        Address addr = ws.parseAddress(target);
+        Address addr = null;
+        if (ProgramWorkspace.hasExplicitAddressPrefix(target)) {
+            addr = ws.parseAddress(target);
+        } else {
+            List<Symbol> found = p.getSymbolTable().getGlobalSymbols(target.trim());
+            if (found.size() == 1) addr = found.getFirst().getAddress();
+            else if (found.size() > 1) {
+                throw new ApiError("AMBIGUOUS_TARGET", "Multiple globals named " + target + "; pass address", null);
+            } else {
+                addr = ws.parseAddress(target);
+            }
+        }
         if (addr == null) addr = resolveGlobal(target).address;
 
         DataType newType = parseType(ApiError.reqStr(op, "type"));
-        int newLen = newType.getLength();
+        int explicitLen = op.get("length") == null ? 0 : ApiError.optInt(op, "length", 0, 1, 1_048_576);
+        int newLen = newType.getLength() > 0 ? newType.getLength() : explicitLen;
         if (newLen <= 0) {
             throw new ApiError("UNSAFE_GLOBAL_TYPE", "Global data type must have fixed positive size", null);
         }
@@ -677,7 +689,9 @@ final class EditService {
         Map<CommentType, String> preservedStartComments = existingAtStart != null ? captureComments(existingAtStart) : Map.of();
 
         p.getListing().clearCodeUnits(addr, clearEnd, false);
-        Data newData = p.getListing().createData(addr, newType);
+        Data newData = newType.getLength() > 0
+                ? p.getListing().createData(addr, newType)
+                : p.getListing().createData(addr, newType, newLen);
         applyCommentsToData(newData, preservedStartComments, op.get("comments"));
 
         String fnHint = ApiError.optStr(op, "function");
@@ -758,6 +772,7 @@ final class EditService {
         fn.setReturnType(def.getReturnType(), SourceType.USER_DEFINED);
         fn.updateFunction(targetCc, null, params,
                 Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, true, SourceType.USER_DEFINED);
+        fn.setVarArgs(def.hasVarArgs());
         if (def.getName() != null && !def.getName().isBlank() && !def.getName().equals(fn.getName())) {
             fn.setName(def.getName(), SourceType.USER_DEFINED);
         }
@@ -922,7 +937,7 @@ final class EditService {
         DataTypeParser parser = new DataTypeParser(dtm, dtm, null, DataTypeParser.AllowedDataTypes.ALL);
         try {
             if (trimmed.startsWith("/")) {
-                int modIdx = firstModifierIndex(trimmed);
+                int modIdx = firstPtrOrArrayIndex(trimmed);
                 String prefix = modIdx >= 0 ? trimmed.substring(0, modIdx) : trimmed;
                 int slash = prefix.lastIndexOf('/');
                 if (slash >= 0) {
@@ -945,6 +960,14 @@ final class EditService {
             }
             throw new ApiError("INVALID_TYPE", ex.getMessage() == null ? "Invalid data type: " + typeSpec : ex.getMessage(), null);
         }
+    }
+
+    private static int firstPtrOrArrayIndex(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch == '*' || ch == '[') return i;
+        }
+        return -1;
     }
 
     private static int firstModifierIndex(String s) {
@@ -970,6 +993,7 @@ final class EditService {
             list.add(new CapturedData(
                     d.getAddress().toString(),
                     d.getDataType().getPathName(),
+                    d.getLength(),
                     commentsToStringMap(captureComments(d))));
         }
         return list;
@@ -1017,12 +1041,13 @@ final class EditService {
 
     private record GlobalHandle(Symbol symbol, Address address) {}
 
-    private record CapturedData(String address, String typePath, Map<String, String> comments) {
+    private record CapturedData(String address, String typePath, int length, Map<String, String> comments) {
         Map<String, Object> toRestoreOp(String fnHint) {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("op", "set_global_type");
             m.put("target", address);
             m.put("type", typePath);
+            if (length > 0) m.put("length", length);
             m.put("allow_resize", true);
             if (!comments.isEmpty()) m.put("comments", comments);
             if (fnHint != null) m.put("function", fnHint);

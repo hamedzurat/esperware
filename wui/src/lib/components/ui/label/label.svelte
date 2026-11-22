@@ -1,0 +1,17 @@
+<script lang="ts">
+  import { cn } from '#lib/utils.ts';
+  import { Label as LabelPrimitive } from 'bits-ui';
+
+  let { ref = $bindable(null), class: className, ...restProps }: LabelPrimitive.RootProps = $props();
+</script>
+
+<LabelPrimitive.Root
+  bind:ref
+  data-slot="label"
+  class={cn(
+    'text-sm leading-none font-medium peer-disabled:cursor-not-allowed peer-disabled:line-through',
+    (restProps.for || restProps.onclick) && 'cursor-pointer',
+    className,
+  )}
+  {...restProps}
+/>

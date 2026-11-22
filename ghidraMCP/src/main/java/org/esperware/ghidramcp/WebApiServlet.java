@@ -8,9 +8,11 @@ import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -37,12 +39,18 @@ final class WebApiServlet extends HttpServlet {
     private final AtomicReference<String> phase = new AtomicReference<>("analyzing");
     private final AtomicReference<String> errorMsg = new AtomicReference<>();
     private final AtomicReference<ReadyContext> ctxRef = new AtomicReference<>();
+    private final AtomicReference<Runnable> shutdownTriggerRef = new AtomicReference<>();
     private final Set<Thread> activeSse = ConcurrentHashMap.newKeySet();
     private final Semaphore eventSlots = new Semaphore(16);
     private boolean eventStreamsClosed;
 
+    void setShutdownTrigger(Runnable shutdownTrigger) {
+        shutdownTriggerRef.set(shutdownTrigger);
+    }
+
     void markReady(ReadyContext ctx) {
         ctxRef.set(ctx);
+        if (ctx.shutdownTrigger() != null) shutdownTriggerRef.set(ctx.shutdownTrigger());
         phase.set("ready");
     }
 
@@ -94,7 +102,7 @@ final class WebApiServlet extends HttpServlet {
                 var versions = ctx.store().listVersions();
                 sendJson(resp, 200, Map.of(
                         "ok", true,
-                        "current_version", versions.getLast().get("version"),
+                        "current_version", ctx.store().currentVersion(),
                         "versions", versions));
             } else if (path.startsWith("/api/v1/versions/")) {
                 long v = Long.parseLong(path.substring("/api/v1/versions/".length()));
@@ -112,18 +120,61 @@ final class WebApiServlet extends HttpServlet {
                 sendJson(resp, 200, diff);
             } else if ("/api/v1/functions".equals(path)) {
                 Map<String, Object> args = new LinkedHashMap<>();
-                if (req.getParameter("filter") != null) args.put("filter", req.getParameter("filter"));
-                if (req.getParameter("sort") != null) args.put("sort", req.getParameter("sort"));
-                if (req.getParameter("cursor") != null) args.put("cursor", req.getParameter("cursor"));
-                if (req.getParameter("limit") != null) args.put("limit", Integer.parseInt(req.getParameter("limit")));
+                putStr(args, "filter", req.getParameter("filter"));
+                putStr(args, "sort", req.getParameter("sort"));
+                putStr(args, "cursor", req.getParameter("cursor"));
+                putInt(args, "limit", req.getParameter("limit"));
                 sendJson(resp, 200, ctx.inspect().listFunctions(args));
             } else if (path.startsWith("/api/v1/functions/")) {
-                String target = URLDecoder.decode(path.substring("/api/v1/functions/".length()), StandardCharsets.UTF_8);
-                Map<String, Object> out = new LinkedHashMap<>(ctx.inspect().decompile(Map.of("target", target)));
+                String target = decodePathSegment(path.substring("/api/v1/functions/".length()));
+                Map<String, Object> decompileArgs = new LinkedHashMap<>();
+                decompileArgs.put("target", target);
+                putInt(decompileArgs, "offset", req.getParameter("offset"));
+                Map<String, Object> out = new LinkedHashMap<>(ctx.inspect().decompile(decompileArgs));
                 if ("true".equalsIgnoreCase(req.getParameter("disasm"))) {
-                    out.put("disassembly", ctx.inspect().disassemble(Map.of("target", target)));
+                    Map<String, Object> disasmArgs = new LinkedHashMap<>();
+                    disasmArgs.put("target", target);
+                    putStr(disasmArgs, "cursor", req.getParameter("disasm_cursor"));
+                    putInt(disasmArgs, "max_instructions", req.getParameter("max_instructions"));
+                    out.put("disassembly", ctx.inspect().disassemble(disasmArgs));
                 }
                 sendJson(resp, 200, out);
+            } else if ("/api/v1/symbols".equals(path)) {
+                Map<String, Object> args = new LinkedHashMap<>();
+                putStr(args, "kind", req.getParameter("kind"));
+                putStr(args, "filter", req.getParameter("filter"));
+                putStr(args, "cursor", req.getParameter("cursor"));
+                putInt(args, "limit", req.getParameter("limit"));
+                sendJson(resp, 200, ctx.inspect().listSymbols(args));
+            } else if ("/api/v1/xrefs".equals(path)) {
+                Map<String, Object> args = new LinkedHashMap<>();
+                putStr(args, "target", req.getParameter("target"));
+                putStr(args, "kind", req.getParameter("kind"));
+                putStr(args, "cursor", req.getParameter("cursor"));
+                putInt(args, "limit", req.getParameter("limit"));
+                sendJson(resp, 200, ctx.inspect().getXrefs(args));
+            } else if ("/api/v1/memory".equals(path)) {
+                Map<String, Object> args = new LinkedHashMap<>();
+                putStr(args, "address", req.getParameter("address"));
+                putInt(args, "size", req.getParameter("size"));
+                putStr(args, "format", req.getParameter("format"));
+                sendJson(resp, 200, ctx.inspect().readMemory(args));
+            } else if ("/api/v1/search".equals(path)) {
+                Map<String, Object> args = new LinkedHashMap<>();
+                putStr(args, "query", req.getParameter("query"));
+                putStr(args, "scope", req.getParameter("scope"));
+                putStr(args, "cursor", req.getParameter("cursor"));
+                putInt(args, "limit", req.getParameter("limit"));
+                sendJson(resp, 200, ctx.inspect().searchCode(args));
+            } else if ("/api/v1/types".equals(path)) {
+                Map<String, Object> args = new LinkedHashMap<>();
+                putStr(args, "query", req.getParameter("query"));
+                if (req.getParameter("exact") != null) {
+                    args.put("exact", "true".equalsIgnoreCase(req.getParameter("exact")));
+                }
+                putStr(args, "cursor", req.getParameter("cursor"));
+                putInt(args, "limit", req.getParameter("limit"));
+                sendJson(resp, 200, ctx.inspect().getType(args));
             } else if ("/api/v1/events".equals(path)) {
                 handleSse(req, resp, ctx.store());
             } else {
@@ -140,11 +191,11 @@ final class WebApiServlet extends HttpServlet {
     protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws IOException {
         String path = req.getRequestURI();
         if ("/api/v1/shutdown".equals(path)) {
-            ReadyContext ctx = ctxRef.get();
+            Runnable trigger = shutdownTriggerRef.get();
             sendJson(resp, 202, Map.of("ok", true, "shutting_down", true));
             Thread.ofVirtual().start(() -> {
                 try { Thread.sleep(50); } catch (InterruptedException ignored) {}
-                if (ctx != null && ctx.shutdownTrigger() != null) ctx.shutdownTrigger().run();
+                if (trigger != null) trigger.run();
             });
             return;
         }
@@ -172,7 +223,7 @@ final class WebApiServlet extends HttpServlet {
     private synchronized void handleSse(HttpServletRequest req, HttpServletResponse resp, VersionStore store)
             throws IOException {
         if (eventStreamsClosed || !eventSlots.tryAcquire()) {
-            resp.sendError(503, "Too many event streams");
+            sendJson(resp, 503, Map.of("ok", false, "code", "TOO_MANY_STREAMS", "error", "Too many event streams"));
             return;
         }
         resp.setContentType("text/event-stream; charset=utf-8");
@@ -247,11 +298,12 @@ final class WebApiServlet extends HttpServlet {
     private void sendFailure(HttpServletResponse resp, Exception failure) throws IOException {
         if (failure instanceof ApiError e) {
             int code = switch (e.code) {
-                case "RECOVERY_REQUIRED" -> 503;
-                case "INCOMPLETE_EXPORT" -> 409;
+                case "RECOVERY_REQUIRED", "DECOMPILER_BUSY" -> 503;
+                case "INCOMPLETE_EXPORT", "STALE_VERSION" -> 409;
                 default -> e.code.contains("NOT_FOUND") ? 404 : 400;
             };
-            sendJson(resp, code, Map.of("ok", false, "code", e.code, "error", e.getMessage()));
+            String msg = e.getMessage() == null ? e.code : e.getMessage();
+            sendJson(resp, code, Map.of("ok", false, "code", e.code, "error", msg));
         } else {
             String message = failure.getMessage();
             sendJson(resp, 500, Map.of("ok", false, "error", message == null ? "internal error" : message));
@@ -267,9 +319,43 @@ final class WebApiServlet extends HttpServlet {
         resp.getOutputStream().write(bytes);
     }
 
+    static String decodePathSegment(String raw) {
+        if (raw == null || raw.isEmpty()) return "";
+        return URLDecoder.decode(raw.replace("+", "%2B"), StandardCharsets.UTF_8);
+    }
+
     private static long parseLongParam(HttpServletRequest req, String name, long def) {
         String raw = req.getParameter(name);
         return (raw == null || raw.isBlank()) ? def : Long.parseLong(raw.trim());
+    }
+
+    private static void putStr(Map<String, Object> args, String key, String val) {
+        if (val != null) args.put(key, val);
+    }
+
+    static boolean isLoopbackOrigin(String origin) {
+        if (origin == null || origin.isBlank() || "null".equalsIgnoreCase(origin)) return false;
+        URI uri;
+        try {
+            uri = URI.create(origin);
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+        String scheme = uri.getScheme();
+        if (!("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))) return false;
+        if (uri.getRawUserInfo() != null || uri.getRawQuery() != null || uri.getRawFragment() != null) return false;
+        int port = uri.getPort();
+        if (port == 0 || port > 65535) return false;
+        String path = uri.getRawPath();
+        if (path != null && !path.isEmpty()) return false;
+        String host = uri.getHost();
+        if (host == null) return false;
+        if (host.startsWith("[") && host.endsWith("]")) host = host.substring(1, host.length() - 1);
+        return Set.of("127.0.0.1", "localhost", "::1").contains(host.toLowerCase(Locale.ROOT));
+    }
+
+    private static void putInt(Map<String, Object> args, String key, String val) {
+        if (val != null && !val.isBlank()) args.put(key, Integer.parseInt(val.trim()));
     }
 
 }

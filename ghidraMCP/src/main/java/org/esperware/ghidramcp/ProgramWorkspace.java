@@ -288,6 +288,23 @@ final class ProgramWorkspace implements AutoCloseable {
         }
     }
 
+    static boolean hasExplicitAddressPrefix(String target) {
+        String trimmed = target == null ? "" : target.trim();
+        return trimmed.startsWith("0x") || trimmed.startsWith("0X") || trimmed.contains(":");
+    }
+
+    Function resolveFunctionByNameOrNull(String target) {
+        if (target == null || target.isBlank()) return null;
+        String trimmed = target.trim();
+        List<Function> exactMatches = new ArrayList<>();
+        FunctionIterator it = program.getFunctionManager().getFunctions(true);
+        while (it.hasNext()) {
+            Function fn = it.next();
+            if (fn.getName().equals(trimmed)) exactMatches.add(fn);
+        }
+        return exactMatches.size() == 1 ? exactMatches.getFirst() : null;
+    }
+
     Function resolveFunction(String target) {
         if (target == null || target.isBlank()) {
             throw new ApiError("INVALID_ARGUMENT", "target must be a non-empty address or function name", null);
@@ -297,6 +314,10 @@ final class ProgramWorkspace implements AutoCloseable {
         if (addr != null) {
             Function exact = program.getFunctionManager().getFunctionAt(addr);
             if (exact != null) return exact;
+            if (!hasExplicitAddressPrefix(trimmed)) {
+                Function byName = resolveFunctionByNameOrNull(trimmed);
+                if (byName != null) return byName;
+            }
             Function containing = program.getFunctionManager().getFunctionContaining(addr);
             if (containing != null) return containing;
         }

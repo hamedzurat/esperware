@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "sourceMap": true,
+    "strict": true,
+    "module": "ESNext",
+    "types": ["$app/types", "node"]
+  },
+  "extends": "$app/tsconfig",
+  "include": ["src", "vite.config.ts"]
+}

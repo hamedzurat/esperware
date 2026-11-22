@@ -1,0 +1,27 @@
+<script lang="ts">
+  import { cn, type Color, type WithElementRef, type WithoutChildren } from '#lib/utils.ts';
+  import type { HTMLAttributes } from 'svelte/elements';
+
+  let {
+    ref = $bindable(null),
+    class: className,
+    color,
+    noShadow,
+    ...restProps
+  }: WithoutChildren<WithElementRef<HTMLAttributes<HTMLDivElement>>> & {
+    color: 'black' | 'bright-black' | Color;
+    noShadow?: boolean;
+  } = $props();
+</script>
+
+<div
+  bind:this={ref}
+  data-slot="skeleton"
+  data-color={color}
+  class={cn(
+    'neoretro-border neoretro-clr rounded p-2',
+    noShadow ? 'animate-pulse' : 'neoretro-shadow neoretro-shadow-bob',
+    className,
+  )}
+  {...restProps}
+></div>

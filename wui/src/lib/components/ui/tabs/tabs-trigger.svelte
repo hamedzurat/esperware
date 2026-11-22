@@ -1,0 +1,37 @@
+<script lang="ts">
+  import { cn } from '#lib/utils.ts';
+  import { Tabs as TabsPrimitive } from 'bits-ui';
+  import { getContext } from 'svelte';
+
+  let {
+    ref = $bindable(null),
+    class: className,
+    value,
+    children,
+    ...restProps
+  }: TabsPrimitive.TriggerProps & { noBrackets?: boolean } = $props();
+
+  const tabsState = getContext<{
+    activeColor: string;
+    inactiveColor: string;
+    activeValue: string;
+    noBrackets: boolean;
+  }>('tabsState');
+</script>
+
+<TabsPrimitive.Trigger
+  bind:ref
+  {value}
+  data-slot="tabs-trigger"
+  data-active-color={tabsState?.activeColor}
+  data-inactive-color={tabsState?.inactiveColor}
+  class={cn(
+    'neoretro-border neoretro-focus disabled:neoretro-disable inline-flex h-full min-w-0 flex-1 basis-0 cursor-pointer items-center justify-center gap-1.5 rounded font-bold whitespace-nowrap transition-all',
+    'data-[state=active]:bg-clr-active data-[state=active]:text-on-clr-active data-[state=active]:z-0 data-[state=active]:translate-1 data-[state=active]:shadow-none',
+    'data-[state=inactive]:bg-clr-inactive data-[state=inactive]:text-on-clr-inactive data-[state=inactive]:shadow-shadow data-[state=inactive]:enabled:active:translate-1 data-[state=inactive]:enabled:active:shadow-none',
+    className,
+  )}
+  {...restProps}
+>
+  {@render children?.()}
+</TabsPrimitive.Trigger>

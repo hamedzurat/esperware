@@ -1,0 +1,33 @@
+<script lang="ts">
+  import { cn, type WithElementRef } from '#lib/utils.ts';
+  import type { HTMLAttributes } from 'svelte/elements';
+
+  let {
+    ref = $bindable(null),
+    class: className,
+    orientation = 'vertical',
+    children,
+    ...restProps
+  }: WithElementRef<HTMLAttributes<HTMLDivElement>> & {
+    orientation?: 'vertical' | 'horizontal' | 'responsive';
+  } = $props();
+</script>
+
+<div
+  bind:this={ref}
+  role="group"
+  data-slot="field"
+  data-orientation={orientation}
+  class={cn(
+    'group/field data-[invalid=true]:text-red flex w-full gap-3',
+    orientation === 'vertical' && 'flex-col *:w-full [&>.sr-only]:w-auto',
+    orientation === 'horizontal' &&
+      'flex-row items-center has-[>[data-slot=field-content]]:items-start *:data-[slot=field-label]:flex-auto has-[>[data-slot=field-content]]:[&>[role=checkbox],[role=radio]]:mt-px',
+    orientation === 'responsive' &&
+      'flex-col *:w-full @md/field-group:flex-row @md/field-group:items-center @md/field-group:*:w-auto @md/field-group:has-[>[data-slot=field-content]]:items-start @md/field-group:*:data-[slot=field-label]:flex-auto [&>.sr-only]:w-auto @md/field-group:has-[>[data-slot=field-content]]:[&>[role=checkbox],[role=radio]]:mt-px',
+    className,
+  )}
+  {...restProps}
+>
+  {@render children?.()}
+</div>

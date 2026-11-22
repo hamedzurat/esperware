@@ -1,0 +1,32 @@
+<script lang="ts">
+  import { cn, type Color, type WithoutChildrenOrChild } from '#lib/utils.ts';
+  import { Switch as SwitchPrimitive } from 'bits-ui';
+
+  let {
+    ref = $bindable(null),
+    class: className,
+    color,
+    checked = $bindable(false),
+    ...restProps
+  }: WithoutChildrenOrChild<SwitchPrimitive.RootProps> & {
+    color: Color;
+  } = $props();
+</script>
+
+<SwitchPrimitive.Root
+  bind:ref
+  bind:checked
+  data-slot="switch"
+  data-pressable
+  data-color={color}
+  class={cn(
+    'peer neoretro-shadow neoretro-border bg-background text-foreground focus-visible:neoretro-focus data-[state=checked]:bg-clr data-[state=checked]:text-on-clr data-[state=checked]:selection:bg-on-clr data-[state=checked]:selection:text-clr disabled:neoretro-disable inline-flex h-6 w-12 shrink-0 cursor-pointer items-center rounded transition-colors',
+    className,
+  )}
+  {...restProps}
+>
+  <SwitchPrimitive.Thumb
+    data-slot="switch-thumb"
+    class="neoretro-border bg-foreground pointer-events-none block size-4 rounded ring-0 transition-transform data-disabled:opacity-50 data-[state=checked]:translate-x-6 data-[state=unchecked]:translate-x-1"
+  />
+</SwitchPrimitive.Root>

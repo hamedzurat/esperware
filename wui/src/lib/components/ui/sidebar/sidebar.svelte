@@ -1,0 +1,107 @@
+<script lang="ts">
+  import * as Sheet from '#lib/components/ui/sheet/index.ts';
+  import { cn, type WithElementRef } from '#lib/utils.ts';
+  import { getContext } from 'svelte';
+  import type { HTMLAttributes } from 'svelte/elements';
+
+  import { SIDEBAR_WIDTH_MOBILE } from './constants.ts';
+  import { useSidebar, type SidebarColorContext } from './context.svelte.ts';
+
+  let {
+    ref = $bindable(null),
+    side = 'left',
+    variant = 'sidebar',
+    collapsible = 'offcanvas',
+    class: className,
+    children,
+    ...restProps
+  }: WithElementRef<HTMLAttributes<HTMLDivElement>> & {
+    side?: 'left' | 'right';
+    variant?: 'sidebar' | 'floating' | 'inset';
+    collapsible?: 'offcanvas' | 'icon' | 'none';
+  } = $props();
+
+  const sidebar = useSidebar();
+  const sidebarColor = getContext<() => SidebarColorContext>('sidebarColor');
+</script>
+
+{#if collapsible === 'none'}
+  <div
+    data-color={sidebarColor().color}
+    class={cn('neoretro-border neoretro-clr min-h-svh w-(--sidebar-width) flex-col', className)}
+    bind:this={ref}
+    {...restProps}
+  >
+    {@render children?.()}
+  </div>
+{:else if sidebar.isMobile}
+  <Sheet.Root bind:open={() => sidebar.openMobile, (v) => sidebar.setOpenMobile(v)} {...restProps}>
+    <Sheet.Content
+      data-sidebar="sidebar"
+      data-slot="sidebar"
+      data-mobile="true"
+      color={sidebarColor().color}
+      data-color={sidebarColor().color}
+      class={cn('neoretro-clr w-(--sidebar-width) p-0 [&>button]:hidden')}
+      style="--sidebar-width: {SIDEBAR_WIDTH_MOBILE};"
+      {side}
+    >
+      <Sheet.Header class="sr-only">
+        <Sheet.Title>Sidebar</Sheet.Title>
+        <Sheet.Description>Displays the mobile sidebar.</Sheet.Description>
+      </Sheet.Header>
+      <div class="flex size-full flex-col">
+        {@render children?.()}
+      </div>
+    </Sheet.Content>
+  </Sheet.Root>
+{:else}
+  <div
+    bind:this={ref}
+    class="group peer hidden md:block"
+    data-state={sidebar.state}
+    data-collapsible={sidebar.state === 'collapsed' ? collapsible : ''}
+    data-variant={variant}
+    data-side={side}
+    data-slot="sidebar"
+  >
+    <!-- This is what handles the sidebar gap on desktop -->
+    <div
+      data-slot="sidebar-gap"
+      class={cn(
+        'relative w-(--sidebar-width) bg-transparent transition-[width] duration-200 ease-linear',
+        'group-data-[collapsible=offcanvas]:w-0',
+        'group-data-[side=right]:rotate-180',
+        variant === 'floating' || variant === 'inset'
+          ? 'group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4))+2px)]'
+          : 'group-data-[collapsible=icon]:w-(--sidebar-width-icon)',
+      )}
+    ></div>
+    <div
+      data-slot="sidebar-container"
+      class={cn(
+        'fixed inset-y-0 z-10 hidden h-svh w-(--sidebar-width) transition-[left,right,width] duration-200 ease-linear md:flex',
+        side === 'left'
+          ? 'left-0 group-data-[collapsible=offcanvas]:-left-(--sidebar-width)'
+          : 'right-0 group-data-[collapsible=offcanvas]:-right-(--sidebar-width)',
+        // Adjust the padding for floating and inset variants.
+        variant === 'floating' || variant === 'inset'
+          ? 'p-2 group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4))+2px)]'
+          : 'group-data-[collapsible=icon]:w-(--sidebar-width-icon) group-data-[side=left]:border-r group-data-[side=right]:border-l',
+        className,
+      )}
+      {...restProps}
+    >
+      <div
+        data-sidebar="sidebar"
+        data-slot="sidebar-inner"
+        data-color={sidebarColor().color}
+        class={cn(
+          'neoretro-clr group-data-[variant=floating]:neoretro-shadow group-data-[variant=floating]:neoretro-border flex size-full flex-col group-data-[variant=floating]:rounded',
+        )}
+      >
+        {@render children?.()}
+      </div>
+    </div>
+  </div>
+{/if}

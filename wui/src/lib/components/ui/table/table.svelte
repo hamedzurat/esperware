@@ -1,0 +1,30 @@
+<script lang="ts">
+  import { cn, type Color, type WithElementRef } from '#lib/utils.ts';
+  import { setContext } from 'svelte';
+  import type { HTMLTableAttributes } from 'svelte/elements';
+
+  let {
+    ref = $bindable(null),
+    class: className,
+    children,
+    headerColor,
+    rowColor,
+    noShadow,
+    ...restProps
+  }: WithElementRef<HTMLTableAttributes> & {
+    headerColor: Color;
+    rowColor: Color;
+    noShadow?: boolean;
+  } = $props();
+
+  setContext('tableHeaderColor', () => headerColor);
+  setContext('tableRowColor', () => rowColor);
+</script>
+
+<div class={cn('neoretro-border relative w-full overflow-clip rounded', noShadow ? '' : 'neoretro-shadow')}>
+  <div class="w-full overflow-auto">
+    <table bind:this={ref} data-slot="table" class={cn('w-full caption-bottom text-sm', className)} {...restProps}>
+      {@render children?.()}
+    </table>
+  </div>
+</div>

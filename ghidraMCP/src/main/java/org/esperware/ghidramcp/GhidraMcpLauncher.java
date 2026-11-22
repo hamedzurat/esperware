@@ -127,6 +127,7 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             webApi.closeSse();
             try { jetty.stop(); } catch (Exception ignored) {}
         };
+        webApi.setShutdownTrigger(shutdownTrigger);
         Runtime.getRuntime().addShutdownHook(new Thread(cleanup, "ghidra-mcp-shutdown"));
 
         try {
@@ -233,8 +234,12 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             resp.addHeader("Vary", "Origin");
             if (origin != null) {
                 String requestOrigin = req.getScheme() + "://" + authority.getRawAuthority();
-                if (!(origin.equalsIgnoreCase(requestOrigin) || origin.equalsIgnoreCase(publicOrigin)
-                        || origin.equalsIgnoreCase(cfg.corsOrigin))) {
+                boolean corsAllowed = origin.equalsIgnoreCase(requestOrigin)
+                        || origin.equalsIgnoreCase(publicOrigin)
+                        || ("loopback".equalsIgnoreCase(cfg.corsOrigin)
+                                ? WebApiServlet.isLoopbackOrigin(origin)
+                                : origin.equalsIgnoreCase(cfg.corsOrigin));
+                if (!corsAllowed) {
                     resp.sendError(403, "Origin is not allowed");
                     return;
                 }

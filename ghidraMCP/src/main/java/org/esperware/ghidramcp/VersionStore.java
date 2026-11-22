@@ -392,7 +392,11 @@ final class VersionStore implements AutoCloseable {
                       AND function_address IN (
                           SELECT function_address FROM function_diffs
                           WHERE version > ? AND version <= ?
-                            AND (LOWER(function_address) = LOWER(?) OR LOWER(function_name) = LOWER(?))
+                            AND (
+                              LOWER(function_address) = LOWER(?)
+                              OR LTRIM(LOWER(function_address), '0') = LTRIM(LOWER(?), '0')
+                              OR LOWER(function_name) = LOWER(?)
+                            )
                       )
                       """ : "")
                 + "ORDER BY version ASC, id ASC";
@@ -407,6 +411,7 @@ final class VersionStore implements AutoCloseable {
                 ps.setLong(i++, fromVersion);
                 ps.setLong(i++, toVersion);
                 ps.setString(i++, clean);
+                ps.setString(i++, clean);
                 ps.setString(i, functionFilter);
             }
             try (ResultSet r = ps.executeQuery()) {
@@ -419,7 +424,7 @@ final class VersionStore implements AutoCloseable {
                         acc.firstBefore = before;
                         acc.seenBefore = true;
                     }
-                    if (after != null) acc.lastAfter = after;
+                    acc.lastAfter = after;
                     acc.latestName = r.getString("function_name");
                     acc.latestStatus = r.getString("decompile_status");
                 }

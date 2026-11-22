@@ -201,9 +201,7 @@ final class ProgramExporter {
         FunctionIterator it = program.getFunctionManager().getFunctions(true);
         while (it.hasNext()) {
             Function fn = it.next();
-            if (fn.isExternal()) continue;
-            MemoryBlock block = program.getMemory().getBlock(fn.getEntryPoint());
-            if (block != null && block.isExternalBlock()) continue;
+            if (InspectService.isExternalFunction(program, fn)) continue;
             functions.add(fn);
         }
         functions.sort(Comparator.comparing(Function::getEntryPoint));

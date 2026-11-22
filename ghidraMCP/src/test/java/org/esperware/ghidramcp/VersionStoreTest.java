@@ -92,6 +92,13 @@ class VersionStoreTest {
             assertTrue(cumulative.contains("+/* mix helper */"));
             assertTrue(cumulative.contains("+void transform"));
 
+            // Unpadded 0x-prefixed hex filter matches zero-padded stored function_address
+            var hexRange = store.diffRange(0L, 2L, "0x40116d");
+            @SuppressWarnings("unchecked")
+            var hexDiffs = (List<Map<String, Object>>) hexRange.get("diffs");
+            assertEquals(1, hexDiffs.size());
+            assertEquals("0040116d", hexDiffs.get(0).get("function_address"));
+
             // inverseOpsRange returns v2 inverse ops BEFORE v1 inverse ops
             var inverses = store.inverseOpsRange(0L, 2L);
             assertEquals(2, inverses.size());

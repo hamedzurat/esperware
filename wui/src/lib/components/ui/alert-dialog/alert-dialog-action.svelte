@@ -1,0 +1,19 @@
+<script lang="ts">
+  import { buttonVariants } from '#lib/components/ui/button/index.ts';
+  import { cn } from '#lib/utils.ts';
+  import { AlertDialog as AlertDialogPrimitive } from 'bits-ui';
+  import { getContext } from 'svelte';
+
+  let { ref = $bindable(null), class: className, ...restProps }: AlertDialogPrimitive.ActionProps = $props();
+
+  const getColor = getContext<() => string>('alertDialogActionColor');
+</script>
+
+<AlertDialogPrimitive.Action
+  bind:ref
+  data-slot="alert-dialog-action"
+  data-color={getColor()}
+  class={cn(buttonVariants(), className)}
+  data-pressable
+  {...restProps}
+/>

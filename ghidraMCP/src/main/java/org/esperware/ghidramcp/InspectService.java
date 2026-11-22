@@ -83,12 +83,26 @@ final class InspectService {
             seg.put("read", block.isRead());
             seg.put("write", block.isWrite());
             seg.put("execute", block.isExecute());
+            seg.put("initialized", block.isInitialized());
+            seg.put("overlay", block.isOverlay());
+            seg.put("external", block.isExternalBlock());
             segments.add(seg);
         }
         List<String> entryPoints = new ArrayList<>();
         var entries = p.getSymbolTable().getExternalEntryPointIterator();
         while (entries.hasNext() && entryPoints.size() < 32) {
-            entryPoints.add(entries.next().toString());
+            Address addr = entries.next();
+            Function fn = p.getFunctionManager().getFunctionAt(addr);
+            MemoryBlock block = p.getMemory().getBlock(addr);
+            if (fn != null && !isExternalFunction(p, fn) && (block == null || block.isExecute())) {
+                entryPoints.add(addr.toString());
+            }
+        }
+        int fnCount = 0;
+        FunctionIterator fnIt = p.getFunctionManager().getFunctions(true);
+        while (fnIt.hasNext()) {
+            fnIt.next();
+            fnCount++;
         }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("version", version);
@@ -99,11 +113,18 @@ final class InspectService {
         out.put("language", p.getLanguageID().getIdAsString());
         out.put("compiler", p.getCompilerSpec().getCompilerSpecID().getIdAsString());
         out.put("endian", p.getMemory().isBigEndian() ? "big" : "little");
-        out.put("function_count", p.getFunctionManager().getFunctionCount());
+        out.put("function_count", fnCount);
         out.put("type_count", p.getDataTypeManager().getDataTypeCount(false));
         out.put("entry_points", entryPoints);
         out.put("segments", segments);
         return out;
+    }
+
+    static boolean isExternalFunction(Program p, Function fn) {
+        if (fn == null) return false;
+        if (fn.isExternal()) return true;
+        MemoryBlock block = p.getMemory().getBlock(fn.getEntryPoint());
+        return block != null && block.isExternalBlock();
     }
 
     Map<String, Object> listFunctions(Map<String, Object> args) throws Exception {
@@ -143,7 +164,7 @@ final class InspectService {
                 row.put("address", fn.getEntryPoint().toString());
                 row.put("name", fn.getName());
                 row.put("size", fn.getBody().getNumAddresses());
-                row.put("external", fn.isExternal());
+                row.put("external", isExternalFunction(ws.program(), fn));
                 row.put("signature", fn.getPrototypeString(false, true));
                 page.add(row);
             }
@@ -321,6 +342,9 @@ final class InspectService {
             Address rawAddr = ws.parseAddress(target);
             Function fn = null;
             if (rawAddr != null) fn = p.getFunctionManager().getFunctionAt(rawAddr);
+            if (fn == null && !ProgramWorkspace.hasExplicitAddressPrefix(target)) {
+                fn = ws.resolveFunctionByNameOrNull(target);
+            }
             if (fn == null && rawAddr == null) fn = ws.resolveFunction(target);
 
             InstructionIterator it;
@@ -389,6 +413,10 @@ final class InspectService {
             Program p = ws.program();
             Address addr = ws.parseAddress(target);
             Function fn = addr != null ? p.getFunctionManager().getFunctionAt(addr) : ws.resolveFunction(target);
+            if (fn == null && addr != null && !ProgramWorkspace.hasExplicitAddressPrefix(target)) {
+                fn = ws.resolveFunctionByNameOrNull(target);
+                if (fn != null) addr = fn.getEntryPoint();
+            }
             if (addr == null && fn != null) addr = fn.getEntryPoint();
             if (addr == null) throw new ApiError("NOT_FOUND", "Target address or function not found: " + target, null);
 
@@ -413,7 +441,10 @@ final class InspectService {
                     row.put("to_address", r.getToAddress().toString());
                     row.put("ref_type", r.getReferenceType().getName());
                     Function fromFn = p.getFunctionManager().getFunctionContaining(r.getFromAddress());
-                    if (fromFn != null) row.put("from_function", fromFn.getName());
+                    if (fromFn != null) {
+                        row.put("from_function", fromFn.getName());
+                        row.put("from_function_address", fromFn.getEntryPoint().toString());
+                    }
                     xrefs.add(row);
                 }
             }
@@ -453,6 +484,9 @@ final class InspectService {
         row.put("ref_type", r.getReferenceType().getName());
         Symbol sym = p.getSymbolTable().getPrimarySymbol(r.getToAddress());
         if (sym != null) row.put("to_symbol", sym.getName());
+        Function toFn = p.getFunctionManager().getFunctionAt(r.getToAddress());
+        row.put("to_is_function", toFn != null);
+        if (toFn != null) row.put("to_function_address", toFn.getEntryPoint().toString());
         return row;
     }
 
@@ -469,7 +503,15 @@ final class InspectService {
         return ws.withReadLock(() -> {
             Address addr = ws.parseAddress(addrStr);
             if (addr == null) throw new ApiError("INVALID_ARGUMENT", "Invalid address: " + addrStr, null);
-            byte[] buf = new byte[size];
+            MemoryBlock blk = ws.program().getMemory().getBlock(addr);
+            if (blk == null) throw new ApiError("NOT_FOUND", "Unmapped memory address: " + addrStr, null);
+            if (!blk.isInitialized()) {
+                throw new ApiError("MEMORY_READ_FAILED",
+                        "Memory at " + addrStr + " is uninitialized (" + blk.getName() + ")", null);
+            }
+            long available = blk.getEnd().subtract(addr) + 1L;
+            int readSize = (int) Math.min(size, Math.max(1L, available));
+            byte[] buf = new byte[readSize];
             try {
                 int read = ws.program().getMemory().getBytes(addr, buf);
                 if (read < buf.length) buf = java.util.Arrays.copyOf(buf, read);
@@ -632,9 +674,10 @@ final class InspectService {
         while (it.hasNext() && scanned < 25 && matches.size() < limit) {
             if (System.nanoTime() - deadline >= 0) break;
             Function fn = it.next();
-            ProgramWorkspace.CachedDecompile res = fn.isExternal() ? null
+            boolean isExt = isExternalFunction(ws.program(), fn);
+            ProgramWorkspace.CachedDecompile res = isExt ? null
                     : ws.decompileCached(fn, SEARCH_DECOMPILE_TIMEOUT_SEC, deadline);
-            if (!fn.isExternal() && res == null) {
+            if (!isExt && res == null) {
                 paused = true;
                 break;
             }

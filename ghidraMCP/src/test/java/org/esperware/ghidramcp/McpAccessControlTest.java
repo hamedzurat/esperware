@@ -61,6 +61,38 @@ class McpAccessControlTest {
         assertEquals("READ_ONLY", err4.code);
     }
 
+    @Test
+    void loopbackOriginMatcherAcceptsOnlyLocalHttpOrigins() {
+        assertTrue(WebApiServlet.isLoopbackOrigin("http://localhost:5173"));
+        assertTrue(WebApiServlet.isLoopbackOrigin("http://127.0.0.1:4173"));
+        assertTrue(WebApiServlet.isLoopbackOrigin("http://[::1]:3000"));
+        assertTrue(WebApiServlet.isLoopbackOrigin("https://localhost"));
+
+        assertFalse(WebApiServlet.isLoopbackOrigin("https://evil.com"));
+        assertFalse(WebApiServlet.isLoopbackOrigin("http://localhost.evil.com:5173"));
+        assertFalse(WebApiServlet.isLoopbackOrigin("null"));
+        assertFalse(WebApiServlet.isLoopbackOrigin("ftp://localhost:5173"));
+        assertFalse(WebApiServlet.isLoopbackOrigin("http://localhost:5173/path"));
+        assertFalse(WebApiServlet.isLoopbackOrigin("http://user@localhost:5173"));
+        assertFalse(WebApiServlet.isLoopbackOrigin("http://localhost:0"));
+        assertFalse(WebApiServlet.isLoopbackOrigin("http://localhost:70000"));
+    }
+
+    @Test
+    void servletAndApiValidationHandlePlusNamesIntBoundsAndEmptyDiffs() {
+        assertEquals("operator+", WebApiServlet.decodePathSegment("operator+"));
+        assertEquals("operator+ foo", WebApiServlet.decodePathSegment("operator+%20foo"));
+        assertEquals("ns::operator+", WebApiServlet.decodePathSegment("ns%3A%3Aoperator%2B"));
+
+        assertThrows(ApiError.class, () -> ApiError.optInt(Map.of("limit", 1.5), "limit", 50, 1, 200));
+        assertThrows(ApiError.class, () -> ApiError.optInt(Map.of("limit", 4_294_967_346L), "limit", 50, 1, 200));
+        assertThrows(ApiError.class, () -> ApiError.reqLong(Map.of("expected_version", 2.5), "expected_version", 0L));
+        assertEquals(50, ApiError.optInt(Map.of("limit", 50.0), "limit", 10, 1, 200));
+
+        String createdDiff = ApiError.unifiedDiff("created @ 00401000", "", "int main(void) {\n  return 0;\n}\n");
+        assertTrue(createdDiff.contains("@@ -0,0 +1,3 @@"), createdDiff);
+    }
+
     @SuppressWarnings("unchecked")
     private static void assertDescriptionsPresent(McpSchema.Tool t) {
         assertNotNull(t.description());

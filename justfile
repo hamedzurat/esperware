@@ -2,6 +2,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 engine := env_var_or_default("CONTAINER_ENGINE", "podman")
 image := env_var_or_default("MCP_IMAGE", "ghidra-mcp:local")
+cors_origin := env_var_or_default("GHIDRA_MCP_CORS_ORIGIN", "loopback")
 
 default:
     @just --list
@@ -52,7 +53,7 @@ _launch mode binary dir fixed_port="":
             -p "127.0.0.1:$port:8765" \
             -e "GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:$port" \
             -e "GHIDRA_MCP_LAUNCH_ID=$launch_id" \
-            -e GHIDRA_MCP_CORS_ORIGIN \
+            -e "GHIDRA_MCP_CORS_ORIGIN={{cors_origin}}" \
             "${mounts[@]}" {{image}} "${workspace[@]}" --cache-dir /data/cache
     }
     find_port() {
@@ -163,9 +164,38 @@ ps:
 logs port="8765":
     @{{engine}} logs "ghidra-mcp-{{port}}"
 
-# Open standalone WebUI pointed at port
-wui port:
-    @xdg-open "file://{{justfile_directory()}}/wui/index.html?port={{port}}" >/dev/null 2>&1 &
+# Build (if needed) and open the WebUI, optionally connected to <port>
+wui port="" ui_port="4173":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    wui_dir="{{justfile_directory()}}/wui"
+    server_port="{{port}}"
+    ui_port="{{ui_port}}"
+    url="http://127.0.0.1:$ui_port"
+    if [ -n "$server_port" ]; then
+        url="$url/?port=$server_port"
+    fi
+    open_browser() {
+        command -v xdg-open >/dev/null 2>&1 && xdg-open "$url" >/dev/null 2>&1 &
+    }
+    if curl -fsS --max-time 1 "http://127.0.0.1:$ui_port/" >/dev/null 2>&1; then
+        echo "Opening $url"
+        open_browser
+        exit 0
+    fi
+    [ -d "$wui_dir/node_modules" ] || bun --cwd "$wui_dir" install
+    [ -f "$wui_dir/build/index.html" ] || bun --cwd "$wui_dir" run build
+    (
+        for _ in $(seq 1 40); do
+            if curl -fsS --max-time 1 "http://127.0.0.1:$ui_port/" >/dev/null 2>&1; then
+                open_browser
+                exit 0
+            fi
+            sleep 0.1
+        done
+    ) &
+    echo "Serving WebUI at $url"
+    exec bun --cwd "$wui_dir" run preview -- --host 127.0.0.1 --port "$ui_port" --strictPort
 
 # Build all C test binaries in artifacts/
 artifacts:

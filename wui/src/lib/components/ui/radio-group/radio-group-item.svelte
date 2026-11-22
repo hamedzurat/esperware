@@ -1,0 +1,25 @@
+<script lang="ts">
+  import { cn, type WithoutChildrenOrChild } from '#lib/utils.ts';
+  import { RadioGroup as RadioGroupPrimitive } from 'bits-ui';
+  import { getContext } from 'svelte';
+
+  let {
+    ref = $bindable(null),
+    class: className,
+    ...restProps
+  }: WithoutChildrenOrChild<RadioGroupPrimitive.ItemProps> = $props();
+
+  let getColor = getContext<() => string>('radioGroupColor');
+</script>
+
+<RadioGroupPrimitive.Item
+  bind:ref
+  data-slot="radio-group-item"
+  data-color={getColor()}
+  class={cn(
+    'peer neoretro-border text-foreground focus-visible:neoretro-focus disabled:neoretro-disable data-[state=checked]:bg-clr data-[state=checked]:text-on-clr data-[state=checked]:selection:bg-on-clr data-[state=checked]:selection:text-clr aspect-square size-4 cursor-pointer rounded-full',
+    getColor() === 'white' || getColor() === 'black' ? 'bg-transparent' : 'bg-background',
+    className,
+  )}
+  {...restProps}
+/>
