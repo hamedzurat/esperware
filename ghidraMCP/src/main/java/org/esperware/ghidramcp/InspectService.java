@@ -64,40 +64,46 @@ final class InspectService {
 
     Map<String, Object> programInfo() throws Exception {
         return ws.withReadLock(() -> {
-            Program p = ws.program();
-            List<Map<String, Object>> segments = new ArrayList<>();
-            for (MemoryBlock block : p.getMemory().getBlocks()) {
-                Map<String, Object> seg = new LinkedHashMap<>();
-                seg.put("name", block.getName());
-                seg.put("start", block.getStart().toString());
-                seg.put("end", block.getEnd().toString());
-                seg.put("size", block.getSize());
-                seg.put("read", block.isRead());
-                seg.put("write", block.isWrite());
-                seg.put("execute", block.isExecute());
-                segments.add(seg);
-            }
-            List<String> entryPoints = new ArrayList<>();
-            var entries = p.getSymbolTable().getExternalEntryPointIterator();
-            while (entries.hasNext() && entryPoints.size() < 32) {
-                entryPoints.add(entries.next().toString());
-            }
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("ok", true);
-            out.put("version", store.currentVersion());
-            out.put("binary_name", ws.binaryName());
-            out.put("binary_sha256", ws.binarySha256());
-            out.put("ghidra_version", ws.ghidraVersion());
-            out.put("format", p.getExecutableFormat());
-            out.put("language", p.getLanguageID().getIdAsString());
-            out.put("compiler", p.getCompilerSpec().getCompilerSpecID().getIdAsString());
-            out.put("endian", p.getMemory().isBigEndian() ? "big" : "little");
-            out.put("function_count", p.getFunctionManager().getFunctionCount());
-            out.put("type_count", p.getDataTypeManager().getDataTypeCount(false));
-            out.put("entry_points", entryPoints);
-            out.put("segments", segments);
+            out.putAll(collectProgramMetadata(store.currentVersion()));
             return out;
         });
+    }
+
+    Map<String, Object> collectProgramMetadata(long version) {
+        Program p = ws.program();
+        List<Map<String, Object>> segments = new ArrayList<>();
+        for (MemoryBlock block : p.getMemory().getBlocks()) {
+            Map<String, Object> seg = new LinkedHashMap<>();
+            seg.put("name", block.getName());
+            seg.put("start", block.getStart().toString());
+            seg.put("end", block.getEnd().toString());
+            seg.put("size", block.getSize());
+            seg.put("read", block.isRead());
+            seg.put("write", block.isWrite());
+            seg.put("execute", block.isExecute());
+            segments.add(seg);
+        }
+        List<String> entryPoints = new ArrayList<>();
+        var entries = p.getSymbolTable().getExternalEntryPointIterator();
+        while (entries.hasNext() && entryPoints.size() < 32) {
+            entryPoints.add(entries.next().toString());
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("version", version);
+        out.put("binary_name", ws.binaryName());
+        out.put("binary_sha256", ws.binarySha256());
+        out.put("ghidra_version", ws.ghidraVersion());
+        out.put("format", p.getExecutableFormat());
+        out.put("language", p.getLanguageID().getIdAsString());
+        out.put("compiler", p.getCompilerSpec().getCompilerSpecID().getIdAsString());
+        out.put("endian", p.getMemory().isBigEndian() ? "big" : "little");
+        out.put("function_count", p.getFunctionManager().getFunctionCount());
+        out.put("type_count", p.getDataTypeManager().getDataTypeCount(false));
+        out.put("entry_points", entryPoints);
+        out.put("segments", segments);
+        return out;
     }
 
     Map<String, Object> listFunctions(Map<String, Object> args) throws Exception {
@@ -178,7 +184,7 @@ final class InspectService {
         });
     }
 
-    private List<Map<String, Object>> collectSymbols(String kind, String folded) {
+    List<Map<String, Object>> collectSymbols(String kind, String folded) {
         Program p = ws.program();
         List<Map<String, Object>> items = new ArrayList<>();
         switch (kind) {

@@ -43,6 +43,11 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
     @Override
     public void launch(GhidraApplicationLayout layout, String[] args) throws Exception {
         Config cfg = Config.parse(args);
+        if (cfg.dump) {
+            runDump(layout, cfg);
+            System.exit(0);
+            return;
+        }
         Path readyFile = cfg.workDir.resolve("ready.json");
         Files.createDirectories(cfg.workDir);
         Files.deleteIfExists(readyFile);
@@ -129,13 +134,14 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
 
             InspectService inspect = new InspectService(ws, store);
             EditService edit = new EditService(ws, store);
+            ProgramExporter exporter = new ProgramExporter(ws, inspect, cfg.workDir);
             McpEndpoints mcp = new McpEndpoints(inspect, edit);
             mcpRef.set(mcp);
 
             rwProxy.attach(mcp.rwTransport());
             roProxy.attach(mcp.roTransport());
             webApi.markReady(new WebApiServlet.ReadyContext(
-                    store, inspect, baseUrl + "/mcp/rw", baseUrl + "/mcp/ro", shutdownTrigger, ws::recoveryRequired));
+                    store, inspect, exporter, baseUrl + "/mcp/rw", baseUrl + "/mcp/ro", shutdownTrigger, ws::recoveryRequired));
 
             Map<String, Object> ready = new LinkedHashMap<>();
             ready.put("status", "ready");
@@ -161,6 +167,34 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
         jetty.join();
         cleanup.run();
         System.exit(0);
+    }
+
+    private static void runDump(GhidraApplicationLayout layout, Config cfg) throws Exception {
+        if (!Application.isInitialized()) {
+            Application.initializeApplication(layout, new HeadlessGhidraApplicationConfiguration());
+        }
+        Path historyDb = cfg.workDir.resolve("history.sqlite");
+        try (ProgramWorkspace ws = ProgramWorkspace.open(cfg.binary, cfg.workDir, cfg.cacheDir, cfg.poolSize);
+             VersionStore store = Files.exists(historyDb) ? new VersionStore(historyDb) : null) {
+            long version;
+            if (store != null) {
+                store.ensureBaseline(Map.of(
+                        "binary_name", ws.binaryName(),
+                        "binary_sha256", ws.binarySha256(),
+                        "ghidra_version", ws.ghidraVersion(),
+                        "arch", ws.program().getLanguageID().getIdAsString()));
+                store.recover(ws.savedVersion(), ws::saveVersion);
+                ws.versionPublished();
+                version = store.currentVersion();
+            } else {
+                version = Math.max(0L, ws.savedVersion());
+            }
+            InspectService inspect = new InspectService(ws, store);
+            ProgramExporter exporter = new ProgramExporter(ws, inspect, cfg.workDir);
+            Map<String, Object> result = exporter.export(version);
+            System.out.println(new Gson().toJson(result));
+            System.out.flush();
+        }
     }
 
     private static Filter accessFilter(Config cfg) {
@@ -191,7 +225,9 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             }
 
             String path = req.getServletPath();
-            boolean writeRoute = "/mcp/rw".equals(path) || "/api/v1/shutdown".equals(path);
+            boolean writeRoute = "/mcp/rw".equals(path)
+                    || "/api/v1/shutdown".equals(path)
+                    || "/api/v1/export".equals(path);
             boolean readRoute = "/mcp/ro".equals(path)
                     || (path.startsWith("/api/v1/") && !"/api/v1/health".equals(path));
             if (origin != null && (writeRoute || readRoute || "/api/v1/health".equals(path))) {
@@ -290,7 +326,8 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             String corsOrigin,
             int poolSize,
             String rwToken,
-            String roToken) {
+            String roToken,
+            boolean dump) {
 
         static Config parse(String[] args) {
             Path binary = null;
@@ -305,6 +342,7 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             int poolSize = 2;
             String rwToken = System.getenv("GHIDRA_MCP_RW_TOKEN");
             String roToken = System.getenv("GHIDRA_MCP_RO_TOKEN");
+            boolean dump = false;
 
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
@@ -319,6 +357,7 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
                     case "--decompiler-pool" -> poolSize = Integer.parseInt(requireArg(args, ++i, "--decompiler-pool"));
                     case "--rw-token" -> rwToken = requireArg(args, ++i, "--rw-token");
                     case "--ro-token" -> roToken = requireArg(args, ++i, "--ro-token");
+                    case "--dump" -> dump = true;
                     default -> throw new IllegalArgumentException("Unknown argument: " + args[i]);
                 }
             }
@@ -348,7 +387,7 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             if (rwToken != null && rwToken.isBlank() || roToken != null && roToken.isBlank()) {
                 throw new IllegalArgumentException("Configured bearer tokens must be non-empty");
             }
-            return new Config(binary, workDir, cacheDir, host, port, publicUrl, corsOrigin, poolSize, rwToken, roToken);
+            return new Config(binary, workDir, cacheDir, host, port, publicUrl, corsOrigin, poolSize, rwToken, roToken, dump);
         }
 
         private static String requireArg(String[] args, int idx, String flag) {

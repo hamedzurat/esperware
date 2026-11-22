@@ -75,6 +75,26 @@ resume dir port="8765":
     echo "Timed out waiting for $dir_abs/run/ready.json" >&2
     exit 1
 
+# One-shot export of pseudocode and metadata into <dir>/run/code/v0: just dump <binary> [dir]
+dump binary dir="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{invocation_directory()}}"
+    bin_abs="$(realpath "{{binary}}")"
+    [ -f "$bin_abs" ] || { echo "Binary not found: $bin_abs" >&2; exit 2; }
+    bin_name="$(basename "$bin_abs")"
+    dir_arg="{{dir}}"
+    if [ -z "$dir_arg" ]; then dir_arg="/tmp/esperware-$(date +%s%N)-${bin_name%.*}"; fi
+    dir_abs="$(realpath -m "$dir_arg")"
+    case "/$dir_abs" in */.*) echo "State dir cannot contain '.'-prefixed segments: $dir_abs" >&2; exit 2 ;; esac
+    mkdir -p "$dir_abs/run"
+    {{engine}} run --rm \
+      -v "$bin_abs:/input/$bin_name:ro" \
+      -v "$dir_abs:/data" \
+      {{image}} \
+      --binary "/input/$bin_name" --work-dir /data/run --no-cache --dump
+    echo "Dumped to $dir_abs/run/code (state: $dir_abs)" >&2
+
 # Stop a running container and wait for its name to become reusable
 stop port="8765":
     #!/usr/bin/env bash

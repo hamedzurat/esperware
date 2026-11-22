@@ -532,6 +532,173 @@ class HeadlessServerE2ETest {
         recovered.shutdownAndAwait();
     }
 
+    @Test
+    void cliDumpAndApiExportProduceZeroDuplicationCodeLayout() throws Exception {
+        // 1. One-shot CLI --dump on unstripped fixture
+        Path dumpWork = tmpRoot.resolve("dump-unstripped");
+        Files.createDirectories(dumpWork);
+        List<String> dumpCmd;
+        if ("local".equalsIgnoreCase(MODE)) {
+            dumpCmd = List.of(
+                    repoDir.resolve("bin/ghidra-mcp").toString(),
+                    "--binary", tmpRoot.resolve("input/other-fixture.elf").toString(),
+                    "--work-dir", dumpWork.toString(),
+                    "--no-cache",
+                    "--dump");
+        } else {
+            dumpCmd = List.of(
+                    ENGINE, "run", "--rm",
+                    "-v", tmpRoot + ":/data",
+                    IMAGE,
+                    "--binary", "/data/input/other-fixture.elf",
+                    "--work-dir", "/data/dump-unstripped",
+                    "--no-cache",
+                    "--dump");
+        }
+        Process dumpProc = new ProcessBuilder(dumpCmd).directory(repoDir.toFile()).start();
+        assertTrue(dumpProc.waitFor(90, TimeUnit.SECONDS), "--dump timed out");
+        String dumpOut = new String(dumpProc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        String dumpErr = new String(dumpProc.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(0, dumpProc.exitValue(), "--dump failed:\nSTDOUT:\n" + dumpOut + "\nSTDERR:\n" + dumpErr);
+
+        String lastJsonLine = dumpOut.lines().map(String::trim).filter(s -> s.startsWith("{"))
+                .reduce((first, second) -> second).orElseThrow(() -> new AssertionError("No JSON summary: " + dumpOut));
+        JsonObject dumpSummary = JsonParser.parseString(lastJsonLine).getAsJsonObject();
+        assertTrue(dumpSummary.get("ok").getAsBoolean());
+        assertEquals(0L, dumpSummary.get("version").getAsLong());
+        assertEquals("code/v0", dumpSummary.get("dir").getAsString());
+        assertFalse(Files.exists(dumpWork.resolve("ready.json")));
+        assertFalse(Files.exists(dumpWork.resolve("history.sqlite")));
+
+        Path v0 = dumpWork.resolve("code/v0");
+        assertTrue(Files.isRegularFile(v0.resolve("manifest.json")));
+        assertTrue(Files.isRegularFile(v0.resolve("types.h")));
+        assertTrue(Files.isRegularFile(v0.resolve("symbols.json")));
+        assertTrue(Files.isRegularFile(v0.resolve("functions.jsonl")));
+        assertTrue(Files.isRegularFile(v0.resolve("callgraph.jsonl")));
+        assertTrue(Files.isRegularFile(v0.resolve("src/readability-fixture.c")));
+        assertFalse(Files.exists(v0.resolve("src/_unmapped.c")));
+        assertTrue(Files.isRegularFile(v0.resolve("src/_sec/init.c")));
+        assertTrue(Files.isDirectory(v0.resolve("src/_text")));
+        try (var textFiles = Files.list(v0.resolve("src/_text"))) {
+            assertTrue(textFiles.anyMatch(p -> p.toString().endsWith(".c")), "Expected .c files in src/_text");
+        }
+        assertFalse(Files.exists(v0.resolve("types.json")));
+        assertFalse(Files.exists(v0.resolve("source_map.jsonl")));
+        assertFalse(Files.exists(v0.resolve("functions")));
+        try (var walk = Files.walk(v0)) {
+            assertEquals(0L, walk.filter(p -> p.toString().endsWith(".asm")).count());
+        }
+
+        assertTrue(Files.readString(v0.resolve("types.h"), StandardCharsets.UTF_8).contains("ProbeState"),
+                "types.h missing ProbeState");
+        assertTrue(Files.readString(v0.resolve("symbols.json"), StandardCharsets.UTF_8).contains("probe_state"),
+                "symbols.json missing probe_state");
+
+        String fixtureSrc = Files.readString(v0.resolve("src/readability-fixture.c"), StandardCharsets.UTF_8);
+        assertTrue(fixtureSrc.startsWith("#include \"../types.h\"\n"), fixtureSrc);
+        int mixIdx = fixtureSrc.indexOf("mix(");
+        int transformIdx = fixtureSrc.indexOf("transform(");
+        int mainIdx = fixtureSrc.indexOf("main(");
+        assertTrue(mixIdx > 0 && transformIdx > mixIdx && mainIdx > transformIdx,
+                "Expected mix, transform, main sorted by line in src/readability-fixture.c:\n" + fixtureSrc);
+        assertTrue(fixtureSrc.contains("readability-fixture.c:"), fixtureSrc);
+
+        Map<String, JsonObject> fnRows = new HashMap<>();
+        for (String line : Files.readAllLines(v0.resolve("functions.jsonl"), StandardCharsets.UTF_8)) {
+            if (line.isBlank()) continue;
+            JsonObject row = JsonParser.parseString(line).getAsJsonObject();
+            assertFalse(row.has("callers"));
+            assertFalse(row.has("callees"));
+            assertFalse(row.has("referenced_globals"));
+            assertFalse(row.has("pseudocode"));
+            assertNotEquals("00405000", row.get("entry_address").getAsString(),
+                    "EXTERNAL stub should not be exported in functions.jsonl");
+            fnRows.put(row.get("name").getAsString(), row);
+        }
+        assertFalse(fnRows.containsKey("__libc_start_main"),
+                "EXTERNAL stub should not be exported in functions.jsonl");
+        for (String expectedFn : List.of("mix", "transform", "main")) {
+            JsonObject row = fnRows.get(expectedFn);
+            assertNotNull(row, "Missing function in functions.jsonl: " + expectedFn);
+            assertEquals("src/readability-fixture.c", row.get("src_file").getAsString());
+            assertEquals("complete", row.get("decompile_status").getAsString());
+            assertTrue(row.getAsJsonArray("variables").size() > 0, "Expected variables for " + expectedFn);
+            assertTrue(row.getAsJsonArray("lines").size() > 0, "Expected DWARF lines for " + expectedFn);
+        }
+
+        boolean sawCallEdge = false;
+        boolean sawDataEdge = false;
+        for (String line : Files.readAllLines(v0.resolve("callgraph.jsonl"), StandardCharsets.UTF_8)) {
+            if (line.isBlank()) continue;
+            JsonObject edge = JsonParser.parseString(line).getAsJsonObject();
+            if ("transform".equals(edge.get("from_fn").getAsString())) {
+                String kind = edge.get("kind").getAsString();
+                String toName = edge.get("to_name").getAsString();
+                if ("call".equals(kind) && "mix".equals(toName)) sawCallEdge = true;
+                if ("data".equals(kind) && "probe_state".equals(toName)) sawDataEdge = true;
+            }
+        }
+        assertTrue(sawCallEdge, "Expected transform -> mix call edge in callgraph.jsonl");
+        assertTrue(sawDataEdge, "Expected transform -> probe_state data edge in callgraph.jsonl");
+
+        JsonObject manifest = JsonParser.parseString(Files.readString(v0.resolve("manifest.json"), StandardCharsets.UTF_8))
+                .getAsJsonObject();
+        assertEquals(0L, manifest.get("version").getAsLong());
+        assertTrue(manifest.getAsJsonObject("counts").get("functions").getAsInt() >= 3);
+
+        // 2. Live server: does not auto-export; POST /api/v1/export requires rw token and tracks versions
+        RunningServer server = startServer("api-export", true, "--rw-token", "exp-rw", "--ro-token", "exp-ro");
+        assertFalse(Files.exists(tmpRoot.resolve("api-export/code")),
+                "Server must not export automatically on startup");
+
+        String exportUrl = server.baseUrl + "/api/v1/export";
+        assertEquals(401, HTTP.send(HttpRequest.newBuilder(URI.create(exportUrl))
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.discarding()).statusCode());
+        assertEquals(401, HTTP.send(HttpRequest.newBuilder(URI.create(exportUrl))
+                .header("Authorization", "Bearer exp-ro")
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.discarding()).statusCode());
+
+        HttpResponse<String> expV0Resp = HTTP.send(HttpRequest.newBuilder(URI.create(exportUrl))
+                .header("Authorization", "Bearer exp-rw")
+                .timeout(Duration.ofSeconds(30))
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, expV0Resp.statusCode(), expV0Resp.body());
+        JsonObject expV0 = JsonParser.parseString(expV0Resp.body()).getAsJsonObject();
+        assertEquals(0L, expV0.get("version").getAsLong());
+        assertEquals("code/v0", expV0.get("dir").getAsString());
+        assertFalse(expV0.has("path"));
+        assertTrue(Files.isRegularFile(tmpRoot.resolve("api-export/code/v0/manifest.json")));
+
+        StreamableMcpClient rw = new StreamableMcpClient(server.baseUrl + "/mcp/rw", "export-rw", "exp-rw");
+        String targetAddr = rw.callOk("search_code", Map.of("query", "7feb352d", "scope", "pseudocode"))
+                .getAsJsonArray("matches").get(0).getAsJsonObject().get("address").getAsString();
+        String expectedSrcFile = "src/_text/" + targetAddr + ".c";
+        Path strippedV0 = tmpRoot.resolve("api-export/code/v0");
+        assertFalse(Files.exists(strippedV0.resolve("src/_unmapped.c")));
+        assertTrue(Files.isRegularFile(strippedV0.resolve(expectedSrcFile)), "Missing " + expectedSrcFile + " in v0");
+        assertFalse(Files.readString(strippedV0.resolve(expectedSrcFile), StandardCharsets.UTF_8).contains("mix_renamed"));
+
+        rw.callOk("apply_edits", Map.of(
+                "expected_version", 0,
+                "reason", "rename mix for export check",
+                "edits", List.of(Map.of("op", "rename_function", "target", targetAddr, "new_name", "mix_renamed"))));
+
+        HttpResponse<String> expV1Resp = HTTP.send(HttpRequest.newBuilder(URI.create(exportUrl))
+                .header("Authorization", "Bearer exp-rw")
+                .timeout(Duration.ofSeconds(30))
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, expV1Resp.statusCode(), expV1Resp.body());
+        JsonObject expV1 = JsonParser.parseString(expV1Resp.body()).getAsJsonObject();
+        assertEquals(1L, expV1.get("version").getAsLong());
+        assertEquals("code/v1", expV1.get("dir").getAsString());
+        Path strippedV1 = tmpRoot.resolve("api-export/code/v1");
+        assertFalse(Files.exists(strippedV1.resolve("src/_unmapped.c")));
+        assertTrue(Files.readString(strippedV1.resolve("functions.jsonl"), StandardCharsets.UTF_8).contains("mix_renamed"));
+        assertTrue(Files.readString(strippedV1.resolve(expectedSrcFile), StandardCharsets.UTF_8).contains("mix_renamed"));
+        server.shutdownAndAwait("exp-rw");
+    }
+
     private static RunningServer startServer(String runName, boolean withBinary, String... options) throws Exception {
         Path workDir = tmpRoot.resolve(runName);
         Files.createDirectories(workDir);
@@ -645,11 +812,15 @@ class HeadlessServerE2ETest {
         }
 
         void shutdownAndAwait() throws Exception {
-            HttpRequest req = HttpRequest.newBuilder(URI.create(baseUrl + "/api/v1/shutdown"))
+            shutdownAndAwait(null);
+        }
+
+        void shutdownAndAwait(String token) throws Exception {
+            HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(baseUrl + "/api/v1/shutdown"))
                     .timeout(Duration.ofSeconds(10))
-                    .POST(HttpRequest.BodyPublishers.noBody())
-                    .build();
-            HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+                    .POST(HttpRequest.BodyPublishers.noBody());
+            if (token != null) b.header("Authorization", "Bearer " + token);
+            HttpResponse<String> resp = HTTP.send(b.build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(202, resp.statusCode(), resp.body());
             assertTrue(proc.waitFor(20, TimeUnit.SECONDS), "Server did not exit within 20s");
             assertEquals(0, proc.exitValue());

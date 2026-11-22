@@ -32,6 +32,7 @@ flowchart LR
 | `GhidraMcpLauncher` | Implements `GhidraLaunchable`; parses flags, boots Jetty and Ghidra, writes `ready.json`, and coordinates shutdown. |
 | `ProgramWorkspace` | Owns the single `GhidraProject` and `Program`, SHA-256 project cache, `ReentrantReadWriteLock`, `DecompInterface` pool, and decompile cache. |
 | `InspectService` | Implements the 9 read-only MCP queries and live inspection REST handlers under read lock. |
+| `ProgramExporter` | Exports zero-duplication pseudocode (`src/`), `types.h`, `symbols.json`, `functions.jsonl`, `callgraph.jsonl`, and `manifest.json` to `<work-dir>/code/v<N>/` via `--dump` or `POST /api/v1/export`. |
 | `EditService` | Enforces `AccessMode.READ_WRITE`, checks `expected_version`, runs single-transaction edits, computes diffs, and applies multi-step reverts under write lock. |
 | `VersionStore` | SQLite WAL ledger storing `v0` metadata, ordered mutation versions, inverse operations, function diffs, checkpoints, and SSE event listeners. |
 | `McpEndpoints` | Registers the read-only and read-write MCP transports with tool annotations. |
@@ -87,4 +88,4 @@ Range diffs compare pseudocode by function address. When a name filter matches a
 
 - **Role isolation**: `McpEndpoints` mounts `/mcp/ro` with only the 9 read tool specifications (`readOnlyHint = true`) and `/mcp/rw` with all 13 tools (`apply_edits`, `define_type`, `revert`, `save_checkpoint` marked `readOnlyHint = false`). `EditService` also checks `AccessMode.READ_WRITE` at entry as defense in depth.
 - A single HTTP filter checks the host, origin, and bearer token for both transports. Loopback hosts, the configured bind host, and the host in `--public-url` are accepted. Browser requests can use the server's origin or one explicit origin from `--cors-origin`.
-- When tokens are configured, either token authorizes inspection, including the REST and event routes. The write token authorizes mutations and shutdown. The health endpoint can load without a token. The standalone viewer calls the REST and event endpoints over HTTP.
+- When tokens are configured, either token authorizes inspection, including the REST and event routes. The write token authorizes mutations, `POST /api/v1/export`, and shutdown. The health endpoint can load without a token. The standalone viewer calls the REST and event endpoints over HTTP.

@@ -26,6 +26,7 @@ final class WebApiServlet extends HttpServlet {
     record ReadyContext(
             VersionStore store,
             InspectService inspect,
+            ProgramExporter exporter,
             String mcpRwUrl,
             String mcpRoUrl,
             Runnable shutdownTrigger,
@@ -140,13 +141,35 @@ final class WebApiServlet extends HttpServlet {
 
     @Override
     protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws IOException {
-        if ("/api/v1/shutdown".equals(req.getRequestURI())) {
+        String path = req.getRequestURI();
+        if ("/api/v1/shutdown".equals(path)) {
             ReadyContext ctx = ctxRef.get();
             sendJson(resp, 202, Map.of("ok", true, "shutting_down", true));
             Thread.ofVirtual().start(() -> {
                 try { Thread.sleep(50); } catch (InterruptedException ignored) {}
                 if (ctx != null && ctx.shutdownTrigger() != null) ctx.shutdownTrigger().run();
             });
+            return;
+        }
+        if ("/api/v1/export".equals(path)) {
+            ReadyContext ctx = ctxRef.get();
+            if (ctx == null) {
+                sendJson(resp, 503, Map.of("ok", false, "status", phase.get(), "error", "Server is still initializing"));
+                return;
+            }
+            try {
+                if (ctx.recoveryRequired().getAsBoolean()) {
+                    throw new ApiError("RECOVERY_REQUIRED", "Restart the server to recover the workspace", null);
+                }
+                Map<String, Object> result = new LinkedHashMap<>(ctx.exporter().exportCurrent(ctx.store()));
+                result.remove("path");
+                sendJson(resp, 200, result);
+            } catch (ApiError e) {
+                int code = "RECOVERY_REQUIRED".equals(e.code) ? 503 : e.code.contains("NOT_FOUND") ? 404 : 400;
+                sendJson(resp, code, Map.of("ok", false, "code", e.code, "error", e.getMessage()));
+            } catch (Exception e) {
+                sendJson(resp, 500, Map.of("ok", false, "error", e.getMessage() == null ? "internal error" : e.getMessage()));
+            }
             return;
         }
         sendJson(resp, 404, Map.of("ok", false, "error", "Not found"));

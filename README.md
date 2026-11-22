@@ -48,7 +48,10 @@ just logs <port>               # View container logs
 just stop <port>               # Graceful shutdown
 just resume /tmp/my-run <port> # Reopen existing project and version history
 just wui <port>                # Open the standalone viewer for this server
+just dump ./artifacts/build/readability-fixture.unstripped.elf /tmp/my-dump  # One-shot export to <dir>/run/code/v0
 ```
+
+You can also trigger an export on a running server via `POST /api/v1/export` (writes `<work-dir>/code/v<current_version>/`; requires the write token when tokens are configured).
 
 The [standalone WUI](wui/index.html) reads the server's REST and event APIs. To open it from disk, set `GHIDRA_MCP_CORS_ORIGIN=null` when you start the container with `just run` or `just resume`. If you host the WUI separately over HTTP, set the server's allowed origin to the WUI's scheme, hostname, and port. Enter the target server's port, base URL, or MCP endpoint URL in the WUI. If you configured tokens, enter the read token there.
 
@@ -75,7 +78,8 @@ Passing `--port 0` binds a free ephemeral port and writes the chosen port into `
 | Flag | Environment variable | Purpose |
 |---|---|---|
 | `--binary <path>` | — | Target binary. If the work directory already contains a project, the binary must match it. |
-| `--work-dir <path>` | — | Run directory for `ghidra-project/`, `history.sqlite`, and `ready.json`. |
+| `--work-dir <path>` | — | Run directory for `ghidra-project/`, `history.sqlite`, `ready.json`, and `code/v<N>/`. |
+| `--dump` | — | Export `<work-dir>/code/v<N>/` pseudocode and metadata once, print JSON summary, and exit without starting HTTP/MCP. |
 | `--cache-dir <path>` | `GHIDRA_MCP_CACHE_DIR` | Directory for analyzed `.gpr` templates keyed by binary SHA-256. |
 | `--no-cache` | — | Disable the SHA-256 project cache. |
 | `--host <addr>` | `GHIDRA_MCP_HOST` | Bind address (default `127.0.0.1`; `0.0.0.0` in container). |
