@@ -131,11 +131,8 @@ final class WebApiServlet extends HttpServlet {
             }
         } catch (NumberFormatException e) {
             sendJson(resp, 400, Map.of("ok", false, "error", "Invalid numeric parameter"));
-        } catch (ApiError e) {
-            int code = "RECOVERY_REQUIRED".equals(e.code) ? 503 : e.code.contains("NOT_FOUND") ? 404 : 400;
-            sendJson(resp, code, Map.of("ok", false, "code", e.code, "error", e.getMessage()));
         } catch (Exception e) {
-            sendJson(resp, 500, Map.of("ok", false, "error", e.getMessage() == null ? "internal error" : e.getMessage()));
+            sendFailure(resp, e);
         }
     }
 
@@ -164,11 +161,8 @@ final class WebApiServlet extends HttpServlet {
                 Map<String, Object> result = new LinkedHashMap<>(ctx.exporter().exportCurrent(ctx.store()));
                 result.remove("path");
                 sendJson(resp, 200, result);
-            } catch (ApiError e) {
-                int code = "RECOVERY_REQUIRED".equals(e.code) ? 503 : e.code.contains("NOT_FOUND") ? 404 : 400;
-                sendJson(resp, code, Map.of("ok", false, "code", e.code, "error", e.getMessage()));
             } catch (Exception e) {
-                sendJson(resp, 500, Map.of("ok", false, "error", e.getMessage() == null ? "internal error" : e.getMessage()));
+                sendFailure(resp, e);
             }
             return;
         }
@@ -248,6 +242,20 @@ final class WebApiServlet extends HttpServlet {
     synchronized void closeSse() {
         eventStreamsClosed = true;
         activeSse.forEach(Thread::interrupt);
+    }
+
+    private void sendFailure(HttpServletResponse resp, Exception failure) throws IOException {
+        if (failure instanceof ApiError e) {
+            int code = switch (e.code) {
+                case "RECOVERY_REQUIRED" -> 503;
+                case "INCOMPLETE_EXPORT" -> 409;
+                default -> e.code.contains("NOT_FOUND") ? 404 : 400;
+            };
+            sendJson(resp, code, Map.of("ok", false, "code", e.code, "error", e.getMessage()));
+        } else {
+            String message = failure.getMessage();
+            sendJson(resp, 500, Map.of("ok", false, "error", message == null ? "internal error" : message));
+        }
     }
 
     private void sendJson(HttpServletResponse resp, int status, Object body) throws IOException {

@@ -39,6 +39,8 @@ flowchart LR
 | `WebApiServlet` | Serves the JSON API, the event stream, and the shutdown route. |
 | `ApiError` | Typed fault (`code`, `currentVersion`), `AccessMode` enum, request argument validation, cursor codec, and LCS unified diff generator. |
 
+Each version's export is published in one atomic directory move. Repeat exports reuse the snapshot after checking the manifest and listed files. An incomplete snapshot produces a CLI error or HTTP `409` with code `INCOMPLETE_EXPORT`.
+
 ## Classloader and headless boot
 
 Ghidra 12.2 requires `-Djava.system.class.loader=ghidra.GhidraClassLoader`. Because `GhidraClassLoader` delegates parent-first to `AppClassLoader`, placing server classes on the JVM `-cp` makes them unable to resolve Ghidra module classes loaded later into `GhidraClassLoader`.

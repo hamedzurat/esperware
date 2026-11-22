@@ -7,93 +7,132 @@ default:
     @just --list
 
 # Start one headless Ghidra MCP container: just run <binary> [dir]
-run binary dir="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd "{{invocation_directory()}}"
-    bin_abs="$(realpath "{{binary}}")"
-    [ -f "$bin_abs" ] || { echo "Binary not found: $bin_abs" >&2; exit 2; }
-    bin_name="$(basename "$bin_abs")"
-    dir_arg="{{dir}}"
-    if [ -z "$dir_arg" ]; then dir_arg="/tmp/esperware-$(date +%s%N)-${bin_name%.*}"; fi
-    dir_abs="$(realpath -m "$dir_arg")"
-    case "/$dir_abs" in */.*) echo "State dir cannot contain '.'-prefixed segments: $dir_abs" >&2; exit 2 ;; esac
-    mkdir -p "$dir_abs/run" "$dir_abs/cache"
-    rm -f "$dir_abs/run/ready.json"
-    port="$(python3 -c $'import socket\nfor port in range(32001, 65536):\n    with socket.socket() as s:\n        try:\n            s.bind(("127.0.0.1", port))\n            print(port)\n            break\n        except OSError:\n            pass\nelse:\n    raise SystemExit("No free port above 32000")')"
-    cname="ghidra-mcp-$port"
-    {{engine}} run --rm -d --name "$cname" \
-      -p "127.0.0.1:$port:8765" \
-      -e "GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:$port" \
-      -e GHIDRA_MCP_CORS_ORIGIN \
-      -v "$bin_abs:/input/$bin_name:ro" \
-      -v "$dir_abs:/data" \
-      {{image}} \
-      --binary "/input/$bin_name" --work-dir /data/run --cache-dir /data/cache >/dev/null
-    for _ in $(seq 1 240); do
-      if [ -f "$dir_abs/run/ready.json" ]; then
-        echo "Started on port $port (state: $dir_abs)" >&2
-        cat "$dir_abs/run/ready.json"
-        exit 0
-      fi
-      if ! {{engine}} container inspect "$cname" >/dev/null 2>&1; then
-        echo "Container $cname exited before becoming ready" >&2
-        exit 1
-      fi
-      sleep 0.25
-    done
-    echo "Timed out waiting for $dir_abs/run/ready.json; check: just logs $port" >&2
-    exit 1
+run binary dir="": (_launch "run" binary dir)
 
 # Resume an existing state directory without re-importing a binary
-resume dir port="8765":
+resume dir port="8765": (_launch "resume" "" dir port)
+
+[private]
+[positional-arguments]
+_launch mode binary dir fixed_port="":
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{invocation_directory()}}"
-    dir_abs="$(realpath "{{dir}}")"
-    [ -f "$dir_abs/run/ghidra-project/workspace.gpr" ] || { echo "No existing workspace in $dir_abs/run" >&2; exit 2; }
-    rm -f "$dir_abs/run/ready.json"
-    cname="ghidra-mcp-{{port}}"
-    {{engine}} run --rm -d --name "$cname" \
-      -p "127.0.0.1:{{port}}:8765" \
-      -e "GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:{{port}}" \
-      -e GHIDRA_MCP_CORS_ORIGIN \
-      -v "$dir_abs:/data" \
-      {{image}} \
-      --work-dir /data/run --cache-dir /data/cache >/dev/null
-    for _ in $(seq 1 240); do
-      if [ -f "$dir_abs/run/ready.json" ]; then
-        cat "$dir_abs/run/ready.json"
+    mode="$1"
+    dir_arg="$3"
+    fixed_port="$4"
+    workspace=(--work-dir /data/run)
+    if [ "$mode" = resume ]; then
+        dir_abs="$(realpath -- "$dir_arg")"
+        [ -f "$dir_abs/run/ghidra-project/workspace.gpr" ] || { echo "No existing workspace in $dir_abs/run" >&2; exit 2; }
+        mounts=(-v "$dir_abs:/data")
+    else
+        bin_abs="$(realpath -- "$2")"
+        [ -f "$bin_abs" ] || { echo "Binary not found: $bin_abs" >&2; exit 2; }
+        bin_name="$(basename "$bin_abs")"
+        if [ -z "$dir_arg" ]; then dir_arg="/tmp/esperware-$(date +%s%N)-${bin_name%.*}"; fi
+        dir_abs="$(realpath -m -- "$dir_arg")"
+        case "/$dir_abs" in */.*) echo "State dir cannot contain '.'-prefixed segments: $dir_abs" >&2; exit 2 ;; esac
+        mkdir -p "$dir_abs/run"
+        mounts=(-v "$bin_abs:/input/$bin_name:ro" -v "$dir_abs:/data")
+        workspace+=(--binary "/input/$bin_name")
+    fi
+
+    if [ "$mode" = dump ]; then
+        {{engine}} run --rm "${mounts[@]}" {{image}} "${workspace[@]}" --no-cache --dump
+        echo "Dumped to $dir_abs/run/code (state: $dir_abs)" >&2
         exit 0
-      fi
-      if ! {{engine}} container inspect "$cname" >/dev/null 2>&1; then
-        echo "Container $cname exited before becoming ready" >&2
-        exit 1
-      fi
-      sleep 0.25
+    fi
+
+    command -v jq >/dev/null || { echo "jq is required to check server readiness" >&2; exit 2; }
+    mkdir -p "$dir_abs/cache"
+    launch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    launch_container() {
+        {{engine}} run --rm -d --name "ghidra-mcp-$port" \
+            -p "127.0.0.1:$port:8765" \
+            -e "GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:$port" \
+            -e "GHIDRA_MCP_LAUNCH_ID=$launch_id" \
+            -e GHIDRA_MCP_CORS_ORIGIN \
+            "${mounts[@]}" {{image}} "${workspace[@]}" --cache-dir /data/cache
+    }
+    find_port() {
+        python3 - "$1" "$2" <<'PY'
+    import socket
+    import sys
+
+    for port in range(int(sys.argv[1]), int(sys.argv[2]) + 1):
+        with socket.socket() as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        print(port)
+        break
+    else:
+        sys.exit(1)
+    PY
+    }
+
+    if [ "$mode" = resume ]; then
+        port="$fixed_port"
+        launch_container >/dev/null
+    else
+        # Randomize the first candidate to spread concurrent launches across ports.
+        first_port=$((32001 + RANDOM))
+        next_port=$first_port
+        last_port=65535
+        while true; do
+            if ! port="$(find_port "$next_port" "$last_port")"; then
+                if [ "$last_port" -lt 65535 ]; then
+                    echo "No free port above 32000" >&2
+                    exit 1
+                fi
+                next_port=32001
+                last_port=$((first_port - 1))
+                continue
+            fi
+            if launch_output=$(launch_container 2>&1); then
+                break
+            else
+                launch_status=$?
+            fi
+
+            cname="ghidra-mcp-$port"
+            if ! {{engine}} container inspect "$cname" >/dev/null 2>&1 &&
+                find_port "$port" "$port" >/dev/null &&
+                [[ "$launch_output" != *"address already in use"* &&
+                    "$launch_output" != *"port is already allocated"* &&
+                    "$launch_output" != *"$cname"*"already in use"* ]]; then
+                printf '%s\n' "$launch_output" >&2
+                exit "$launch_status"
+            fi
+            next_port=$((port + 1))
+        done
+    fi
+
+    cname="ghidra-mcp-$port"
+    base_url="http://127.0.0.1:$port"
+    ready_file="$dir_abs/run/ready.json"
+    for _ in $(seq 1 240); do
+        if ! {{engine}} container inspect "$cname" >/dev/null 2>&1; then
+            echo "Container $cname exited before becoming ready" >&2
+            exit 1
+        fi
+        if ready=$(cat -- "$ready_file" 2>/dev/null) &&
+            jq -e --arg launch_id "$launch_id" --arg api_url "$base_url/api/v1" \
+                '.status == "ready" and .launch_id == $launch_id and .api_url == $api_url' \
+                >/dev/null 2>&1 <<<"$ready"; then
+            echo "Started on port $port (state: $dir_abs)" >&2
+            printf '%s\n' "$ready"
+            exit 0
+        fi
+        sleep 0.25
     done
-    echo "Timed out waiting for $dir_abs/run/ready.json" >&2
+    echo "Timed out waiting for $ready_file; check: just logs $port" >&2
     exit 1
 
-# One-shot export of pseudocode and metadata into <dir>/run/code/v0: just dump <binary> [dir]
-dump binary dir="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd "{{invocation_directory()}}"
-    bin_abs="$(realpath "{{binary}}")"
-    [ -f "$bin_abs" ] || { echo "Binary not found: $bin_abs" >&2; exit 2; }
-    bin_name="$(basename "$bin_abs")"
-    dir_arg="{{dir}}"
-    if [ -z "$dir_arg" ]; then dir_arg="/tmp/esperware-$(date +%s%N)-${bin_name%.*}"; fi
-    dir_abs="$(realpath -m "$dir_arg")"
-    case "/$dir_abs" in */.*) echo "State dir cannot contain '.'-prefixed segments: $dir_abs" >&2; exit 2 ;; esac
-    mkdir -p "$dir_abs/run"
-    {{engine}} run --rm \
-      -v "$bin_abs:/input/$bin_name:ro" \
-      -v "$dir_abs:/data" \
-      {{image}} \
-      --binary "/input/$bin_name" --work-dir /data/run --no-cache --dump
-    echo "Dumped to $dir_abs/run/code (state: $dir_abs)" >&2
+# Export pseudocode and metadata into <dir>/run/code/v<N>
+dump binary dir="": (_launch "dump" binary dir)
 
 # Stop a running container and wait for its name to become reusable
 stop port="8765":

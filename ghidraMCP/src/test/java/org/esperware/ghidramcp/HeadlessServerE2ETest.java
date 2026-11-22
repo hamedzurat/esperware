@@ -18,6 +18,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.sql.DriverManager;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -27,6 +28,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -407,6 +409,9 @@ class HeadlessServerE2ETest {
         String[] access = {"--rw-token", "e2e-write", "--ro-token", "e2e-read",
                 "--cors-origin", "http://localhost:9876"};
         RunningServer server = startServer("durability", true, access);
+        AssertionError busy = assertThrows(AssertionError.class, () -> startServer("durability", false));
+        assertTrue(busy.getMessage().contains("Workspace is already in use"), busy.getMessage());
+        assertEquals(server.readyJson, JsonParser.parseString(Files.readString(server.readyFile)).getAsJsonObject());
         String base = server.baseUrl;
         String api = base + "/api/v1";
         assertEquals(200, get(api + "/health").statusCode());
@@ -668,7 +673,35 @@ class HeadlessServerE2ETest {
         assertEquals(0L, expV0.get("version").getAsLong());
         assertEquals("code/v0", expV0.get("dir").getAsString());
         assertFalse(expV0.has("path"));
-        assertTrue(Files.isRegularFile(tmpRoot.resolve("api-export/code/v0/manifest.json")));
+        Path manifestPath = tmpRoot.resolve("api-export/code/v0/manifest.json");
+        assertTrue(Files.isRegularFile(manifestPath));
+        Files.setLastModifiedTime(manifestPath, java.nio.file.attribute.FileTime.fromMillis(1_000_000));
+        var publishedAt = Files.getLastModifiedTime(manifestPath);
+
+        HttpResponse<String> repeatedExport = HTTP.send(HttpRequest.newBuilder(URI.create(exportUrl))
+                .header("Authorization", "Bearer exp-rw")
+                .timeout(Duration.ofSeconds(30))
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, repeatedExport.statusCode(), repeatedExport.body());
+        assertEquals(expV0, JsonParser.parseString(repeatedExport.body()).getAsJsonObject());
+        assertEquals(publishedAt, Files.getLastModifiedTime(manifestPath));
+
+        Path typesPath = manifestPath.resolveSibling("types.h");
+        Path heldTypes = tmpRoot.resolve("api-export-types.h");
+        Files.move(typesPath, heldTypes);
+        try {
+            HttpResponse<String> incomplete = HTTP.send(HttpRequest.newBuilder(URI.create(exportUrl))
+                    .header("Authorization", "Bearer exp-rw")
+                    .timeout(Duration.ofSeconds(30))
+                    .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(409, incomplete.statusCode(), incomplete.body());
+            JsonObject failure = JsonParser.parseString(incomplete.body()).getAsJsonObject();
+            assertEquals("INCOMPLETE_EXPORT", failure.get("code").getAsString());
+            assertTrue(failure.get("error").getAsString().contains("missing types.h"));
+            assertEquals(publishedAt, Files.getLastModifiedTime(manifestPath));
+        } finally {
+            Files.move(heldTypes, typesPath);
+        }
 
         StreamableMcpClient rw = new StreamableMcpClient(server.baseUrl + "/mcp/rw", "export-rw", "exp-rw");
         String targetAddr = rw.callOk("search_code", Map.of("query", "7feb352d", "scope", "pseudocode"))
@@ -703,7 +736,7 @@ class HeadlessServerE2ETest {
         Path workDir = tmpRoot.resolve(runName);
         Files.createDirectories(workDir);
         Path readyFile = workDir.resolve("ready.json");
-        Files.deleteIfExists(readyFile);
+        String launchId = UUID.randomUUID().toString();
 
         if ("local".equalsIgnoreCase(MODE)) {
             List<String> cmd = new ArrayList<>(List.of(
@@ -716,8 +749,9 @@ class HeadlessServerE2ETest {
                 cmd.add(fixturePath.toString());
             }
             cmd.addAll(List.of(options));
-            Process proc = new ProcessBuilder(cmd).directory(repoDir.toFile()).start();
-            RunningServer srv = new RunningServer(proc, null, null, readyFile);
+            ProcessBuilder builder = new ProcessBuilder(cmd).directory(repoDir.toFile());
+            builder.environment().put("GHIDRA_MCP_LAUNCH_ID", launchId);
+            RunningServer srv = new RunningServer(builder.start(), null, null, readyFile, launchId);
             STARTED.add(srv);
             srv.awaitReady(null);
             return srv;
@@ -727,6 +761,7 @@ class HeadlessServerE2ETest {
         List<String> cmd = new ArrayList<>(List.of(
                 ENGINE, "run", "--rm", "--name", cname,
                 "-p", "127.0.0.1::8765",
+                "-e", "GHIDRA_MCP_LAUNCH_ID=" + launchId,
                 "-v", tmpRoot + ":/data",
                 IMAGE,
                 "--work-dir", "/data/" + runName,
@@ -737,7 +772,7 @@ class HeadlessServerE2ETest {
         }
         cmd.addAll(List.of(options));
         Process proc = new ProcessBuilder(cmd).start();
-        RunningServer srv = new RunningServer(proc, ENGINE, cname, readyFile);
+        RunningServer srv = new RunningServer(proc, ENGINE, cname, readyFile, launchId);
         STARTED.add(srv);
         srv.awaitReady(() -> resolveContainerPort(ENGINE, cname));
         return srv;
@@ -773,14 +808,16 @@ class HeadlessServerE2ETest {
         final String engine;
         final String containerName;
         final Path readyFile;
+        final String launchId;
         JsonObject readyJson;
         String baseUrl;
 
-        RunningServer(Process proc, String engine, String containerName, Path readyFile) {
+        RunningServer(Process proc, String engine, String containerName, Path readyFile, String launchId) {
             this.proc = proc;
             this.engine = engine;
             this.containerName = containerName;
             this.readyFile = readyFile;
+            this.launchId = launchId;
         }
 
         void awaitReady(PortLookup portLookup) throws Exception {
@@ -791,20 +828,20 @@ class HeadlessServerE2ETest {
                     String err = new String(proc.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
                     fail("Server exited early (" + proc.exitValue() + ")\nSTDOUT:\n" + out + "\nSTDERR:\n" + err);
                 }
-                if (Files.exists(readyFile)) {
-                    String txt = Files.readString(readyFile, StandardCharsets.UTF_8).trim();
-                    if (!txt.isEmpty()) {
-                        JsonObject json = JsonParser.parseString(txt).getAsJsonObject();
-                        if ("ready".equals(json.get("status").getAsString())) {
-                            this.readyJson = json;
-                            if (portLookup != null) {
-                                this.baseUrl = "http://127.0.0.1:" + portLookup.port();
-                            } else {
-                                this.baseUrl = json.get("api_url").getAsString().replaceFirst("/api/v1$", "");
-                            }
-                            return;
+                try {
+                    JsonObject json = JsonParser.parseString(Files.readString(readyFile)).getAsJsonObject();
+                    if ("ready".equals(json.get("status").getAsString())
+                            && launchId.equals(json.get("launch_id").getAsString())) {
+                        this.readyJson = json;
+                        if (portLookup != null) {
+                            this.baseUrl = "http://127.0.0.1:" + portLookup.port();
+                        } else {
+                            this.baseUrl = json.get("api_url").getAsString().replaceFirst("/api/v1$", "");
                         }
+                        return;
                     }
+                } catch (NoSuchFileException ignored) {
+                    // The launcher removes stale readiness before startup.
                 }
                 Thread.sleep(250);
             }

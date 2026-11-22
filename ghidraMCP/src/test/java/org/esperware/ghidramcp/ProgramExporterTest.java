@@ -42,6 +42,20 @@ class ProgramExporterTest {
     }
 
     @Test
+    void normalizeSourcePathsKeepsFilesAndDirectoriesDistinct() {
+        Map<String, String> fileFirst = ProgramExporter.normalizeSourcePaths(List.of(
+                "dir name", "dir:name/one.c", "dir:name/two.c"));
+        assertEquals("src/dir_name", fileFirst.get("dir name"));
+        assertEquals("src/dir_name_2/one.c", fileFirst.get("dir:name/one.c"));
+        assertEquals("src/dir_name_2/two.c", fileFirst.get("dir:name/two.c"));
+
+        Map<String, String> directoryFirst = ProgramExporter.normalizeSourcePaths(List.of(
+                "dir name/one.c", "dir:name"));
+        assertEquals("src/dir_name/one.c", directoryFirst.get("dir name/one.c"));
+        assertEquals("src/dir_name_2", directoryFirst.get("dir:name"));
+    }
+
+    @Test
     void classifyFallbackSourceRoutesNamespaceTextAndSections() {
         assertEquals("src/_ns/Net/Parser.c",
                 ProgramExporter.classifyFallbackSource(List.of("Net", "Parser"), ".text", "00401100"));

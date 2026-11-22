@@ -2,6 +2,10 @@ package org.esperware.ghidramcp;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
 import ghidra.program.database.sourcemap.SourceFile;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressRange;
@@ -24,9 +28,11 @@ import ghidra.program.model.symbol.SymbolType;
 import ghidra.util.task.TaskMonitor;
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -48,6 +54,8 @@ import java.util.concurrent.Future;
 /** Exports a zero-duplication Ghidra pseudocode and metadata snapshot into &lt;work-dir&gt;/code/v&lt;version&gt;/. */
 final class ProgramExporter {
     private static final int DECOMPILE_TIMEOUT_SEC = 30;
+    private static final Set<String> REQUIRED_FILES = Set.of(
+            "manifest.json", "types.h", "functions.jsonl", "callgraph.jsonl", "symbols.json");
 
     private final ProgramWorkspace ws;
     private final InspectService inspect;
@@ -57,6 +65,10 @@ final class ProgramExporter {
     private final Gson prettyGson = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
     private record LineSpan(String file, int line, String start, String end) {}
+
+    private record EdgeSource(Address address, Function function) {}
+
+    private record EdgeTarget(Address address, String name) {}
 
     private record FunctionExport(
             Function fn,
@@ -83,6 +95,12 @@ final class ProgramExporter {
 
     private Map<String, Object> exportUnderReadLock(long version) throws Exception {
         synchronized (exportLock) {
+            Path codeRoot = workDir.resolve("code");
+            Path targetDir = codeRoot.resolve("v" + version);
+            if (Files.exists(targetDir, LinkOption.NOFOLLOW_LINKS)) {
+                return reuseSnapshot(targetDir, version);
+            }
+
             Program program = ws.program();
             List<Function> functions = collectFunctions(program);
             List<ProgramWorkspace.CachedDecompile> decompiled = decompileAll(functions);
@@ -100,7 +118,9 @@ final class ProgramExporter {
                 if (primary != null) distinctRawSources.add(primary);
             }
 
-            Map<String, String> sourceMap = normalizeSourcePaths(distinctRawSources);
+            SourcePaths paths = new SourcePaths();
+            Map<String, String> sourceMap = normalizeSourcePaths(distinctRawSources, paths);
+            Map<String, String> fallbackPaths = new HashMap<>();
             List<FunctionExport> fnExports = new ArrayList<>(functions.size());
             Map<String, List<FunctionExport>> bySourceFile = new LinkedHashMap<>();
             int decompiledCount = 0;
@@ -112,10 +132,11 @@ final class ProgramExporter {
                 String primary = rawPrimaryFiles.get(i);
                 String srcFile = primary != null ? sourceMap.get(primary) : null;
                 if (srcFile == null) {
-                    srcFile = classifyFallbackSource(
+                    String candidate = classifyFallbackSource(
                             fallbackNamespaceParts(fn),
                             sectionName(program, fn),
                             fn.getEntryPoint().toString());
+                    srcFile = fallbackPaths.computeIfAbsent(candidate, paths::reserve);
                 }
                 List<SourceMapEntry> entries = rawEntriesPerFn.get(i);
                 List<LineSpan> lines = new ArrayList<>(entries.size());
@@ -138,11 +159,8 @@ final class ProgramExporter {
                 bySourceFile.computeIfAbsent(srcFile, k -> new ArrayList<>()).add(fx);
             }
 
-            Path codeRoot = workDir.resolve("code");
             Files.createDirectories(codeRoot);
-            // Never use '.'-prefixed segments under workDir; Ghidra forbids them in project paths.
-            Path stageDir = codeRoot.resolve("tmp-v" + version + "-" + UUID.randomUUID());
-            Files.createDirectories(stageDir);
+            Path stageDir = Files.createDirectory(codeRoot.resolve("tmp-v" + version + "-" + UUID.randomUUID()));
 
             try {
                 writeTypesHeader(program, stageDir.resolve("types.h"));
@@ -170,17 +188,8 @@ final class ProgramExporter {
                 manifest.put("files", files);
                 Files.writeString(stageDir.resolve("manifest.json"), prettyGson.toJson(manifest) + "\n", StandardCharsets.UTF_8);
 
-                Path targetDir = codeRoot.resolve("v" + version);
-                swapDirectory(stageDir, targetDir, codeRoot, version);
-
-                Map<String, Object> result = new LinkedHashMap<>();
-                result.put("ok", true);
-                result.put("version", version);
-                result.put("dir", "code/v" + version);
-                result.put("path", targetDir.toAbsolutePath().toString());
-                result.put("counts", counts);
-                result.put("files", files);
-                return result;
+                Files.move(stageDir, targetDir, StandardCopyOption.ATOMIC_MOVE);
+                return exportResult(targetDir, version, counts, files);
             } finally {
                 deleteTreeBestEffort(stageDir);
             }
@@ -419,29 +428,26 @@ final class ProgramExporter {
         long edges = 0;
         try (BufferedWriter bw = Files.newBufferedWriter(outFile, StandardCharsets.UTF_8)) {
             for (Function fn : functions) {
-                String fnName = fn.getName();
-                String fnEntry = fn.getEntryPoint().toString();
                 Set<String> seenEdges = new LinkedHashSet<>();
-                Set<String> emittedCallees = new HashSet<>();
+                Set<Address> emittedCallees = new HashSet<>();
 
                 InstructionIterator insIt = program.getListing().getInstructions(fn.getBody(), true);
                 while (insIt.hasNext()) {
                     Instruction ins = insIt.next();
-                    String fromAddr = ins.getAddress().toString();
+                    EdgeSource source = new EdgeSource(ins.getAddress(), fn);
                     for (Reference r : program.getReferenceManager().getReferencesFrom(ins.getAddress())) {
                         if (r.getReferenceType().isCall()) {
                             Address to = r.getToAddress();
                             Function callee = program.getFunctionManager().getFunctionAt(to);
-                            String toAddr = to.toString();
                             String toName;
                             if (callee != null) {
                                 toName = callee.getName();
-                                emittedCallees.add(callee.getEntryPoint().toString());
+                                emittedCallees.add(callee.getEntryPoint());
                             } else {
                                 Symbol sym = program.getSymbolTable().getPrimarySymbol(to);
-                                toName = sym != null ? sym.getName(true) : toAddr;
+                                toName = sym != null ? sym.getName(true) : to.toString();
                             }
-                            if (emitEdge(bw, seenEdges, fromAddr, fnName, fnEntry, toAddr, toName, "call")) edges++;
+                            if (emitEdge(bw, seenEdges, source, new EdgeTarget(to, toName), "call")) edges++;
                         } else if (r.getReferenceType().isData()) {
                             Data d = program.getListing().getDefinedDataContaining(r.getToAddress());
                             if (d == null) continue;
@@ -449,11 +455,11 @@ final class ProgramExporter {
                             Symbol sym = program.getSymbolTable().getPrimarySymbol(dataAddr);
                             if (d.hasStringValue()) {
                                 String toName = sym != null ? sym.getName() : dataAddr.toString();
-                                if (emitEdge(bw, seenEdges, fromAddr, fnName, fnEntry, dataAddr.toString(), toName, "string")) {
+                                if (emitEdge(bw, seenEdges, source, new EdgeTarget(dataAddr, toName), "string")) {
                                     edges++;
                                 }
                             } else if (sym != null && sym.isGlobal() && sym.getSymbolType() != SymbolType.FUNCTION) {
-                                if (emitEdge(bw, seenEdges, fromAddr, fnName, fnEntry, dataAddr.toString(), sym.getName(), "data")) {
+                                if (emitEdge(bw, seenEdges, source, new EdgeTarget(dataAddr, sym.getName()), "data")) {
                                     edges++;
                                 }
                             }
@@ -465,9 +471,10 @@ final class ProgramExporter {
                 List<Function> called = new ArrayList<>(fn.getCalledFunctions(TaskMonitor.DUMMY));
                 called.sort(Comparator.comparing(Function::getEntryPoint));
                 for (Function callee : called) {
-                    String calleeAddr = callee.getEntryPoint().toString();
+                    Address calleeAddr = callee.getEntryPoint();
                     if (!emittedCallees.contains(calleeAddr)) {
-                        if (emitEdge(bw, seenEdges, fnEntry, fnName, fnEntry, calleeAddr, callee.getName(), "call")) {
+                        EdgeSource source = new EdgeSource(fn.getEntryPoint(), fn);
+                        if (emitEdge(bw, seenEdges, source, new EdgeTarget(calleeAddr, callee.getName()), "call")) {
                             edges++;
                         }
                     }
@@ -480,19 +487,18 @@ final class ProgramExporter {
     private boolean emitEdge(
             BufferedWriter bw,
             Set<String> seen,
-            String fromAddr,
-            String fromFn,
-            String fromFnAddr,
-            String toAddr,
-            String toName,
+            EdgeSource source,
+            EdgeTarget target,
             String kind) throws IOException {
+        String fromAddr = source.address().toString();
+        String toAddr = target.address().toString();
         if (!seen.add(fromAddr + "\0" + toAddr + "\0" + kind)) return false;
         Map<String, Object> edge = new LinkedHashMap<>();
         edge.put("from_addr", fromAddr);
-        edge.put("from_fn", fromFn);
-        edge.put("from_fn_addr", fromFnAddr);
+        edge.put("from_fn", source.function().getName());
+        edge.put("from_fn_addr", source.function().getEntryPoint().toString());
         edge.put("to_addr", toAddr);
-        edge.put("to_name", toName);
+        edge.put("to_name", target.name());
         edge.put("kind", kind);
         bw.write(compactGson.toJson(edge));
         bw.write('\n');
@@ -522,36 +528,73 @@ final class ProgramExporter {
     private static List<String> listRelativeFiles(Path root) throws IOException {
         List<String> files = new ArrayList<>();
         try (var stream = Files.walk(root)) {
-            stream.filter(Files::isRegularFile).forEach(p ->
+            stream.filter(p -> Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)).forEach(p ->
                     files.add(root.relativize(p).toString().replace('\\', '/')));
         }
         files.sort(String::compareTo);
         return files;
     }
 
-    private static void swapDirectory(Path stageDir, Path targetDir, Path codeRoot, long version) throws IOException {
-        Path backupDir = null;
-        try {
-            if (Files.exists(targetDir)) {
-                backupDir = codeRoot.resolve("old-v" + version + "-" + UUID.randomUUID());
-                moveDir(targetDir, backupDir);
-            }
-            moveDir(stageDir, targetDir);
-            if (backupDir != null) deleteTreeBestEffort(backupDir);
-        } catch (IOException | RuntimeException ex) {
-            if (backupDir != null && Files.exists(backupDir) && !Files.exists(targetDir)) {
-                try { moveDir(backupDir, targetDir); } catch (IOException suppressed) { ex.addSuppressed(suppressed); }
-            }
-            throw ex;
+    private static Map<String, Object> reuseSnapshot(Path targetDir, long version) {
+        Path manifestPath = targetDir.resolve("manifest.json");
+        if (!Files.isDirectory(targetDir, LinkOption.NOFOLLOW_LINKS)
+                || !Files.isRegularFile(manifestPath, LinkOption.NOFOLLOW_LINKS)) {
+            throw incompleteExport(version, "missing manifest.json");
         }
+
+        JsonObject manifest;
+        try (var reader = Files.newBufferedReader(manifestPath, StandardCharsets.UTF_8)) {
+            manifest = JsonParser.parseReader(reader).getAsJsonObject();
+        } catch (IOException | JsonParseException | IllegalStateException e) {
+            throw incompleteExport(version, "manifest.json is unreadable or invalid");
+        }
+
+        JsonElement recordedVersion = manifest.get("version");
+        JsonElement counts = manifest.get("counts");
+        JsonElement files = manifest.get("files");
+        if (recordedVersion == null || !recordedVersion.isJsonPrimitive()
+                || !recordedVersion.getAsJsonPrimitive().isNumber()
+                || !Long.toString(version).equals(recordedVersion.getAsString())
+                || counts == null || !counts.isJsonObject() || files == null || !files.isJsonArray()) {
+            throw incompleteExport(version, "manifest.json has invalid snapshot metadata");
+        }
+
+        Set<String> listedFiles = new HashSet<>();
+        for (JsonElement file : files.getAsJsonArray()) {
+            if (!file.isJsonPrimitive() || !file.getAsJsonPrimitive().isString()
+                    || !listedFiles.add(file.getAsString())) {
+                throw incompleteExport(version, "manifest.json has an invalid file list");
+            }
+        }
+        if (!listedFiles.containsAll(REQUIRED_FILES)) {
+            throw incompleteExport(version, "manifest.json omits required files");
+        }
+
+        try {
+            listedFiles.removeAll(listRelativeFiles(targetDir));
+        } catch (IOException | UncheckedIOException e) {
+            throw incompleteExport(version, "could not read the snapshot file list");
+        }
+        if (!listedFiles.isEmpty()) {
+            String missing = listedFiles.stream().min(String::compareTo).orElseThrow();
+            throw incompleteExport(version, "missing " + missing);
+        }
+        return exportResult(targetDir, version, counts, files);
     }
 
-    private static void moveDir(Path src, Path dst) throws IOException {
-        try {
-            Files.move(src, dst, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException ignored) {
-            Files.move(src, dst);
-        }
+    private static ApiError incompleteExport(long version, String detail) {
+        return new ApiError("INCOMPLETE_EXPORT", "Snapshot code/v" + version + " is incomplete: " + detail, version);
+    }
+
+    private static Map<String, Object> exportResult(Path targetDir, long version, Object counts, Object files) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("version", version);
+        result.put("dir", "code/v" + version);
+        result.put("path", targetDir.toString());
+        result.put("counts", counts);
+        result.put("files", files);
+        return result;
     }
 
     private static void deleteTreeBestEffort(Path dir) {
@@ -564,6 +607,10 @@ final class ProgramExporter {
     }
 
     static Map<String, String> normalizeSourcePaths(Collection<String> rawPaths) {
+        return normalizeSourcePaths(rawPaths, new SourcePaths());
+    }
+
+    private static Map<String, String> normalizeSourcePaths(Collection<String> rawPaths, SourcePaths paths) {
         Map<String, String> result = new LinkedHashMap<>();
         if (rawPaths == null || rawPaths.isEmpty()) return result;
 
@@ -587,13 +634,11 @@ final class ProgramExporter {
             }
         }
 
-        Set<String> usedTargets = new HashSet<>();
-
         if (project.size() == 1) {
             String raw = project.getFirst();
             List<String> segs = resolvedProjectSegs.get(raw);
             String file = segs.isEmpty() ? "_file.c" : segs.getLast();
-            result.put(raw, reserveUniqueTarget("src/" + file, usedTargets));
+            result.put(raw, paths.reserve("src/" + file));
         } else if (project.size() > 1) {
             List<List<String>> dirLists = new ArrayList<>(project.size());
             for (String raw : project) {
@@ -606,7 +651,7 @@ final class ProgramExporter {
                 List<String> relSegs = commonPrefix < segs.size()
                         ? segs.subList(commonPrefix, segs.size())
                         : (segs.isEmpty() ? List.of("_file.c") : List.of(segs.getLast()));
-                result.put(raw, reserveUniqueTarget("src/" + String.join("/", relSegs), usedTargets));
+                result.put(raw, paths.reserve("src/" + String.join("/", relSegs)));
             }
         }
 
@@ -614,7 +659,7 @@ final class ProgramExporter {
             String norm = raw.trim().replace('\\', '/').replaceAll("/+", "/");
             List<String> segs = cleanSegments(norm, false);
             if (segs.isEmpty()) segs = List.of("_external.c");
-            result.put(raw, reserveUniqueTarget("src/_external/" + String.join("/", segs), usedTargets));
+            result.put(raw, paths.reserve("src/_external/" + String.join("/", segs)));
         }
         return result;
     }
@@ -669,17 +714,31 @@ final class ProgramExporter {
         return len;
     }
 
-    private static String reserveUniqueTarget(String candidate, Set<String> usedTargets) {
-        if (usedTargets.add(candidate)) return candidate;
-        int slash = candidate.lastIndexOf('/');
-        int dot = candidate.lastIndexOf('.');
-        String base = (dot > slash) ? candidate.substring(0, dot) : candidate;
-        String ext = (dot > slash) ? candidate.substring(dot) : "";
-        int n = 2;
-        while (true) {
-            String next = base + "_" + n + ext;
-            if (usedTargets.add(next)) return next;
-            n++;
+    private static final class SourcePaths {
+        private final Set<String> files = new HashSet<>();
+        private final Set<String> directories = new HashSet<>();
+
+        String reserve(String candidate) {
+            String[] parts = candidate.split("/");
+            String parent = "";
+            for (int i = 0; i < parts.length - 1; i++) {
+                String directory = parent + parts[i];
+                for (int suffix = 2; files.contains(directory); suffix++) {
+                    directory = parent + parts[i] + "_" + suffix;
+                }
+                directories.add(directory);
+                parent = directory + "/";
+            }
+
+            String name = parts[parts.length - 1];
+            int dot = name.lastIndexOf('.');
+            String base = dot >= 0 ? name.substring(0, dot) : name;
+            String ext = dot >= 0 ? name.substring(dot) : "";
+            String file = parent + name;
+            for (int suffix = 2; directories.contains(file) || !files.add(file); suffix++) {
+                file = parent + base + "_" + suffix + ext;
+            }
+            return file;
         }
     }
 }

@@ -15,11 +15,13 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.channels.FileChannel;
 import java.security.MessageDigest;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.Locale;
@@ -43,13 +45,24 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
     @Override
     public void launch(GhidraApplicationLayout layout, String[] args) throws Exception {
         Config cfg = Config.parse(args);
-        if (cfg.dump) {
-            runDump(layout, cfg);
-            System.exit(0);
-            return;
-        }
-        Path readyFile = cfg.workDir.resolve("ready.json");
         Files.createDirectories(cfg.workDir);
+        try (var channel = FileChannel.open(cfg.workDir.resolve("workspace.lock"),
+                     StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+             var lock = channel.tryLock()) {
+            if (lock == null) {
+                throw new IOException("Workspace is already in use: " + cfg.workDir);
+            }
+            if (cfg.dump) {
+                runDump(layout, cfg);
+            } else {
+                runServer(layout, cfg);
+            }
+        }
+        System.exit(0);
+    }
+
+    private void runServer(GhidraApplicationLayout layout, Config cfg) throws Exception {
+        Path readyFile = cfg.workDir.resolve("ready.json");
         Files.deleteIfExists(readyFile);
 
         ProxyServlet rwProxy = new ProxyServlet();
@@ -100,13 +113,15 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
         AtomicBoolean cleanedUp = new AtomicBoolean(false);
 
         Runnable cleanup = () -> {
-            if (!cleanedUp.compareAndSet(false, true)) return;
-            try { Files.deleteIfExists(readyFile); } catch (Exception ignored) {}
-            webApi.closeSse();
-            try { if (mcpRef.get() != null) mcpRef.get().close(); } catch (Exception ignored) {}
-            try { if (!jetty.isStopped()) jetty.stop(); } catch (Exception ignored) {}
-            try { if (storeRef.get() != null) storeRef.get().close(); } catch (Exception ignored) {}
-            try { if (wsRef.get() != null) wsRef.get().close(); } catch (Exception ignored) {}
+            synchronized (cleanedUp) {
+                if (cleanedUp.getAndSet(true)) return;
+                try { Files.deleteIfExists(readyFile); } catch (Exception ignored) {}
+                webApi.closeSse();
+                try { if (mcpRef.get() != null) mcpRef.get().close(); } catch (Exception ignored) {}
+                try { if (!jetty.isStopped()) jetty.stop(); } catch (Exception ignored) {}
+                try { if (storeRef.get() != null) storeRef.get().close(); } catch (Exception ignored) {}
+                try { if (wsRef.get() != null) wsRef.get().close(); } catch (Exception ignored) {}
+            }
         };
         Runnable shutdownTrigger = () -> {
             webApi.closeSse();
@@ -124,13 +139,7 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
 
             VersionStore store = new VersionStore(cfg.workDir.resolve("history.sqlite"));
             storeRef.set(store);
-            store.ensureBaseline(Map.of(
-                    "binary_name", ws.binaryName(),
-                    "binary_sha256", ws.binarySha256(),
-                    "ghidra_version", ws.ghidraVersion(),
-                    "arch", ws.program().getLanguageID().getIdAsString()));
-            store.recover(ws.savedVersion(), ws::saveVersion);
-            ws.versionPublished();
+            recoverHistory(ws, store);
 
             InspectService inspect = new InspectService(ws, store);
             EditService edit = new EditService(ws, store);
@@ -145,6 +154,8 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
 
             Map<String, Object> ready = new LinkedHashMap<>();
             ready.put("status", "ready");
+            String launchId = System.getenv("GHIDRA_MCP_LAUNCH_ID");
+            if (launchId != null) ready.put("launch_id", launchId);
             ready.put("pid", ProcessHandle.current().pid());
             ready.put("binary_name", ws.binaryName());
             ready.put("binary_sha256", ws.binarySha256());
@@ -157,16 +168,18 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             writeAtomically(readyFile, jsonLine + "\n");
             System.out.println(jsonLine);
             System.out.flush();
-        } catch (Exception initFailure) {
+        } catch (Exception | Error initFailure) {
             webApi.markError(initFailure.getMessage());
             Msg.error(this, "Failed to initialize headless Ghidra MCP", initFailure);
             cleanup.run();
             throw initFailure;
         }
 
-        jetty.join();
-        cleanup.run();
-        System.exit(0);
+        try {
+            jetty.join();
+        } finally {
+            cleanup.run();
+        }
     }
 
     private static void runDump(GhidraApplicationLayout layout, Config cfg) throws Exception {
@@ -178,13 +191,7 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
              VersionStore store = Files.exists(historyDb) ? new VersionStore(historyDb) : null) {
             long version;
             if (store != null) {
-                store.ensureBaseline(Map.of(
-                        "binary_name", ws.binaryName(),
-                        "binary_sha256", ws.binarySha256(),
-                        "ghidra_version", ws.ghidraVersion(),
-                        "arch", ws.program().getLanguageID().getIdAsString()));
-                store.recover(ws.savedVersion(), ws::saveVersion);
-                ws.versionPublished();
+                recoverHistory(ws, store);
                 version = store.currentVersion();
             } else {
                 version = Math.max(0L, ws.savedVersion());
@@ -195,6 +202,16 @@ public final class GhidraMcpLauncher implements GhidraLaunchable {
             System.out.println(new Gson().toJson(result));
             System.out.flush();
         }
+    }
+
+    private static void recoverHistory(ProgramWorkspace ws, VersionStore store) throws Exception {
+        store.ensureBaseline(Map.of(
+                "binary_name", ws.binaryName(),
+                "binary_sha256", ws.binarySha256(),
+                "ghidra_version", ws.ghidraVersion(),
+                "arch", ws.program().getLanguageID().getIdAsString()));
+        store.recover(ws.savedVersion(), ws::saveVersion);
+        ws.versionPublished();
     }
 
     private static Filter accessFilter(Config cfg) {
