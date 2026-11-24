@@ -105,7 +105,7 @@
                 @{ep} · data
               </Button>
             {:else}
-              <Badge color="bright-black">@{ep} · uninit</Badge>
+              <Badge color="white">@{ep} · uninit</Badge>
             {/if}
           {/each}
         </div>

@@ -82,7 +82,7 @@ export type StatusResponse = {
   uptime_ms: number;
 };
 
-export type VersionFunctionRef = {
+type VersionFunctionRef = {
   function_address: string;
   function_name: string;
   decompile_status: string;
@@ -106,7 +106,7 @@ export type VersionsResponse = {
   versions: VersionSummary[];
 };
 
-export type FunctionDiff = {
+type FunctionDiff = {
   function_address: string;
   function_name: string;
   before_c: string | null;
@@ -183,7 +183,7 @@ export type DisasmInstruction = {
   eol_comment?: string;
 };
 
-export type DisassemblyResult = {
+type DisassemblyResult = {
   ok: boolean;
   version: number;
   scope: string;
@@ -292,7 +292,7 @@ export type SearchResponse = {
   next_cursor?: string;
 };
 
-export type TypeField = {
+type TypeField = {
   ordinal: number;
   offset: number;
   name: string;
@@ -302,7 +302,7 @@ export type TypeField = {
   comment?: string;
 };
 
-export type TypeEnumValue = {
+type TypeEnumValue = {
   name: string;
   value: number;
 };
@@ -473,15 +473,15 @@ function stripLeadingHexZeros(hex: string): string {
   return hex.replace(/^0+(?=.)/, '');
 }
 
+export function addressKey(addr: string | undefined | null): string {
+  if (!addr) return '';
+  const n = normalizeAddress(addr);
+  return /^[0-9a-f]+$/.test(n) ? stripLeadingHexZeros(n) : n;
+}
+
 export function sameAddress(a: string | undefined | null, b: string | undefined | null): boolean {
   if (!a || !b) return false;
-  const na = normalizeAddress(a);
-  const nb = normalizeAddress(b);
-  if (na === nb) return true;
-  if (/^[0-9a-f]+$/.test(na) && /^[0-9a-f]+$/.test(nb)) {
-    return stripLeadingHexZeros(na) === stripLeadingHexZeros(nb);
-  }
-  return false;
+  return addressKey(a) === addressKey(b);
 }
 
 function parseHexBigInt(raw: string): bigint | null {
@@ -583,17 +583,38 @@ export function formatRouteError(route: string, err: unknown): string {
   return err instanceof Error ? err.message : 'Request failed.';
 }
 
-export function createGhidraClient(baseUrl: string, token = '') {
+function combineSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([a, b]);
+  }
+  const controller = new AbortController();
+  if (a.aborted || b.aborted) {
+    controller.abort();
+    return controller.signal;
+  }
+  const onAbort = () => controller.abort();
+  a.addEventListener('abort', onAbort, { once: true });
+  b.addEventListener('abort', onAbort, { once: true });
+  return controller.signal;
+}
+
+export function createGhidraClient(baseUrl: string, token = '', sessionSignal?: AbortSignal) {
   const trimmedToken = token.trim();
 
   async function requestRaw(path: string, opts?: { method?: 'GET' | 'POST'; signal?: AbortSignal }): Promise<Response> {
+    const signal = combineSignals(sessionSignal, opts?.signal);
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
     const headers: Record<string, string> = trimmedToken ? { Authorization: `Bearer ${trimmedToken}` } : {};
     let response: Response;
     try {
       response = await fetch(baseUrl + path, {
         method: opts?.method ?? 'GET',
         headers,
-        signal: opts?.signal,
+        signal,
         redirect: 'error',
       });
     } catch (error) {
@@ -692,13 +713,14 @@ export function createGhidraClient(baseUrl: string, token = '') {
       onState: (state: SseConnectionState, detail?: string) => void,
       signal: AbortSignal,
     ) {
+      const effectiveSignal = combineSignals(sessionSignal, signal) ?? signal;
       let retryMs = 2000;
-      while (!signal.aborted) {
+      while (!effectiveSignal.aborted) {
         let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
         let stopRetry = false;
         try {
           onState('connecting');
-          const response = await requestRaw('/api/v1/events', { signal });
+          const response = await requestRaw('/api/v1/events', { signal: effectiveSignal });
           if (!response.body) {
             throw new ApiRequestError('Event stream body unavailable.');
           }
@@ -707,7 +729,7 @@ export function createGhidraClient(baseUrl: string, token = '') {
           const decoder = new TextDecoder();
           reader = response.body.getReader();
           let buffer = '';
-          while (!signal.aborted) {
+          while (!effectiveSignal.aborted) {
             const { value, done } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
@@ -719,7 +741,7 @@ export function createGhidraClient(baseUrl: string, token = '') {
             }
           }
         } catch (error) {
-          if (signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
+          if (effectiveSignal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
             return;
           }
           if (error instanceof ApiRequestError && (error.status === 401 || error.status === 403)) {
@@ -731,14 +753,14 @@ export function createGhidraClient(baseUrl: string, token = '') {
             await reader.cancel().catch(() => {});
           }
         }
-        if (signal.aborted || stopRetry) return;
+        if (effectiveSignal.aborted || stopRetry) return;
         onState('reconnecting');
         const jitter = Math.floor(Math.random() * 400);
         const waitMs = retryMs + jitter;
         retryMs = Math.min(30_000, retryMs * 2);
         await new Promise<void>((resolve) => {
           const timer = setTimeout(resolve, waitMs);
-          signal.addEventListener(
+          effectiveSignal.addEventListener(
             'abort',
             () => {
               clearTimeout(timer);
@@ -760,7 +782,7 @@ export function collectTouchedFunctions(versions: VersionSummary[]): TouchedFunc
   const ordered = [...versions].sort((a, b) => a.version - b.version);
   for (const v of ordered) {
     for (const fn of v.functions) {
-      const key = fn.function_address.toLowerCase();
+      const key = addressKey(fn.function_address);
       const existing = byAddr.get(key);
       if (existing) {
         existing.name = fn.function_name;
@@ -1028,4 +1050,31 @@ export function buildNavUrl(rawTarget: string, nav: UrlNavState): string {
   }
 
   return `?${params.toString()}`;
+}
+
+/** Extracts ordered server targets (`port` / `api` params) unless `?new` is present. */
+export function parseInitialTargets(search: string): string[] {
+  const params = new URLSearchParams(search);
+  if (params.has('new')) return [];
+  const out: string[] = [];
+  for (const [key, value] of params.entries()) {
+    if (key === 'port' || key === 'api') {
+      const trimmed = value.trim();
+      if (trimmed) out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+/** Serializes 1..N server targets into a compact query string (`?port=...&api=...`). */
+export function buildMultiServerQuery(rawTargets: string[]): string {
+  const params = new URLSearchParams();
+  for (const raw of rawTargets) {
+    const single = new URLSearchParams(buildServerQuery(raw));
+    for (const [key, value] of single.entries()) {
+      params.append(key, value);
+    }
+  }
+  const str = params.toString();
+  return str ? `?${str}` : '';
 }

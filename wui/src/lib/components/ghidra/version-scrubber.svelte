@@ -3,8 +3,9 @@
   import ChevronRightIcon from '@lucide/svelte/icons/chevron-right';
   import CodeIcon from '@lucide/svelte/icons/code';
   import GitCompareIcon from '@lucide/svelte/icons/git-compare';
-  import HistoryIcon from '@lucide/svelte/icons/history';
   import SearchCodeIcon from '@lucide/svelte/icons/search-code';
+  import ScrubberDiffView from '#lib/components/ghidra/scrubber-diff-view.svelte';
+  import ScrubberSidebar from '#lib/components/ghidra/scrubber-sidebar.svelte';
   import * as Alert from '#lib/components/ui/alert/index.js';
   import { Badge } from '#lib/components/ui/badge/index.js';
   import * as ButtonGroup from '#lib/components/ui/button-group/index.js';
@@ -13,7 +14,6 @@
   import { getKeyedVariant, setKeyedVariant } from '#lib/components/ui/code-block/code-block-store.svelte.ts';
   import { CodeBlock, type CodeBlockVariant } from '#lib/components/ui/code-block/index.js';
   import * as Collapsible from '#lib/components/ui/collapsible/index.js';
-  import * as Item from '#lib/components/ui/item/index.js';
   import * as Select from '#lib/components/ui/select/index.js';
   import { Slider } from '#lib/components/ui/slider/index.js';
   import Spinner from '#lib/components/ui/spinner/spinner.svelte';
@@ -25,7 +25,6 @@
     SHIKI_CONFIG,
     type FunctionRow,
     type GhidraClient,
-    type RangeDiffResponse,
     type SegmentInfo,
     type UrlNavState,
     type VersionDetail,
@@ -35,6 +34,7 @@
   import { SvelteMap } from 'svelte/reactivity';
 
   let {
+    paneSlot = 0,
     client,
     versions,
     currentVersion,
@@ -47,6 +47,7 @@
     onInspectFunction,
     onNavChange = undefined,
   }: {
+    paneSlot?: number;
     client: GhidraClient;
     versions: VersionSummary[];
     currentVersion: number;
@@ -60,7 +61,7 @@
     onNavChange?: (patch: Partial<UrlNavState>) => void;
   } = $props();
 
-  const variantKey = $derived(`esperware-scrub-${client.baseUrl}`);
+  const variantKey = $derived(`esperware-scrub-${paneSlot}`);
 
   let sidebarTab = $state<'versions' | 'functions'>('versions');
   let scrubMode = $state<'snapshot' | 'diff'>(untrack(() => initialNav?.scrubMode ?? 'snapshot'));
@@ -71,21 +72,17 @@
   let selectedFnAddr = $state(untrack(() => initialNav?.scrubFn ?? ''));
   let diffFnFilter = $state(untrack(() => initialNav?.scrubFn || '__all__'));
   let opsOpen = $state(false);
+  let variantReady = $state(false);
 
   let fallbackFunctions = $state<FunctionRow[]>([]);
   let fallbackCodeMap = new SvelteMap<string, { name: string; code: string }>();
   let loadingTimeline = $state(false);
   let timelineError = $state<string | null>(null);
 
-  let rangeDiff = $state<RangeDiffResponse | null>(null);
-  let rangeDiffLoading = $state(false);
-  let rangeDiffError = $state<string | null>(null);
-
   let lastKnownMax = -1;
   let lastFocusSeq = 0;
   let timelineReqSeq = 0;
-  let diffReqSeq = 0;
-  let diffDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+  let historyCtrl: AbortController | null = null;
 
   const maxVersion = $derived(versions.length ? versions[versions.length - 1].version : currentVersion);
   const versionsDesc = $derived([...versions].reverse());
@@ -173,6 +170,10 @@
   }
 
   async function prefetchFunctionHistory(addr: string) {
+    historyCtrl?.abort();
+    const ctrl = new AbortController();
+    historyCtrl = ctrl;
+
     const req = ++timelineReqSeq;
     timelineError = null;
     const relevant = versions
@@ -188,17 +189,18 @@
     try {
       if (missing.length > 0) {
         await Promise.all(missing.map((v) => ensureVersionDetail(v)));
-        if (req !== timelineReqSeq) return;
+        if (req !== timelineReqSeq || ctrl.signal.aborted) return;
       }
       if (relevant.length === 0 && !hasFallback) {
-        const detail = await client.functionDetail(addr);
-        if (req !== timelineReqSeq) return;
+        const detail = await client.functionDetail(addr, undefined, ctrl.signal);
+        if (req !== timelineReqSeq || ctrl.signal.aborted) return;
         fallbackCodeMap.set(detail.function.address.toLowerCase(), {
           name: detail.function.name,
           code: detail.pseudocode || detail.decompile_error || '/* empty */',
         });
       }
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
       if (req === timelineReqSeq) {
         timelineError = error instanceof Error ? error.message : 'Failed to load version history.';
       }
@@ -207,69 +209,6 @@
         loadingTimeline = false;
       }
     }
-  }
-
-  async function loadRangeDiff(from: number, to: number, fnFilter: string) {
-    const req = ++diffReqSeq;
-    rangeDiffLoading = true;
-    rangeDiffError = null;
-    try {
-      const target = fnFilter === '__all__' ? undefined : fnFilter;
-      const res = await client.diff(from, to, target);
-      if (req !== diffReqSeq) return;
-      rangeDiff = res;
-    } catch (error) {
-      if (req === diffReqSeq) {
-        rangeDiffError = error instanceof Error ? error.message : 'Failed to load diff range.';
-      }
-    } finally {
-      if (req === diffReqSeq) {
-        rangeDiffLoading = false;
-      }
-    }
-  }
-
-  function scheduleRangeDiff(from: number, to: number, fnFilter: string, immediate = false) {
-    if (diffDebounceTimer) {
-      clearTimeout(diffDebounceTimer);
-      diffDebounceTimer = undefined;
-    }
-    if (immediate) {
-      void loadRangeDiff(from, to, fnFilter);
-      return;
-    }
-    diffDebounceTimer = setTimeout(() => {
-      void loadRangeDiff(from, to, fnFilter);
-    }, 120);
-  }
-
-  function handleRangeDrag(values: number[]) {
-    if (values.length < 2) return;
-    const nextFrom = Math.min(values[0], values[1]);
-    const nextTo = Math.max(values[0], values[1]);
-    rangeFrom = nextFrom;
-    rangeTo = nextTo;
-    selectedVersion = nextTo;
-    scheduleRangeDiff(nextFrom, nextTo, diffFnFilter, false);
-  }
-
-  function handleRangeCommit(values: number[]) {
-    if (values.length < 2) return;
-    const nextFrom = Math.min(values[0], values[1]);
-    const nextTo = Math.max(values[0], values[1]);
-    rangeFrom = nextFrom;
-    rangeTo = nextTo;
-    selectedVersion = nextTo;
-    scheduleRangeDiff(nextFrom, nextTo, diffFnFilter, true);
-  }
-
-  function applyRangePreset(from: number, to: number) {
-    const clampedFrom = Math.max(0, Math.min(maxVersion, from));
-    const clampedTo = Math.max(clampedFrom, Math.min(maxVersion, to));
-    rangeFrom = clampedFrom;
-    rangeTo = clampedTo;
-    selectedVersion = clampedTo;
-    scheduleRangeDiff(clampedFrom, clampedTo, diffFnFilter, true);
   }
 
   function handleSidebarVersionClick(v: VersionSummary) {
@@ -282,44 +221,23 @@
       }
       setScrubVersion(v.version);
     } else {
-      applyRangePreset(Math.max(0, v.version - 1), v.version);
+      rangeFrom = Math.max(0, v.version - 1);
+      rangeTo = v.version;
     }
   }
 
   function handleSidebarFnClick(address: string) {
     selectedFnAddr = address;
     diffFnFilter = address;
-    if (scrubMode === 'diff') {
-      scheduleRangeDiff(rangeFrom, rangeTo, address, true);
-    }
   }
 
   function switchScrubMode(nextMode: 'snapshot' | 'diff') {
     scrubMode = nextMode;
-    if (nextMode === 'snapshot') {
-      if (diffDebounceTimer) {
-        clearTimeout(diffDebounceTimer);
-        diffDebounceTimer = undefined;
-      }
-      return;
-    }
-    if (nextMode === 'diff') {
-      if (rangeTo === 0 && maxVersion > 0) {
-        rangeFrom = Math.max(0, maxVersion - 1);
-        rangeTo = maxVersion;
-      }
-      scheduleRangeDiff(rangeFrom, rangeTo, diffFnFilter, true);
+    if (nextMode === 'diff' && rangeTo === 0 && maxVersion > 0) {
+      rangeFrom = Math.max(0, maxVersion - 1);
+      rangeTo = maxVersion;
     }
   }
-
-  $effect(() => {
-    return () => {
-      if (diffDebounceTimer) {
-        clearTimeout(diffDebounceTimer);
-        diffDebounceTimer = undefined;
-      }
-    };
-  });
 
   // Keep version state synced when live SSE versions arrive.
   $effect(() => {
@@ -330,6 +248,7 @@
       untrack(() => {
         const initVer = initialNav?.scrubVersion !== undefined ? initialNav.scrubVersion : nextMax;
         setScrubVersion(initVer);
+        variantReady = true;
         const initTo = initialNav?.diffTo !== undefined ? Math.max(0, Math.min(nextMax, initialNav.diffTo)) : nextMax;
         const initFrom =
           initialNav?.diffFrom !== undefined
@@ -339,7 +258,6 @@
         rangeTo = initTo;
         if (scrubMode === 'diff') {
           selectedVersion = initTo;
-          scheduleRangeDiff(initFrom, initTo, diffFnFilter, true);
         }
       });
       return;
@@ -352,7 +270,6 @@
         }
         if (rangeTo === prevMax) {
           rangeTo = nextMax;
-          if (scrubMode === 'diff') scheduleRangeDiff(rangeFrom, nextMax, diffFnFilter, true);
         }
       });
     }
@@ -373,18 +290,18 @@
     const hasTouched = touchedFunctions.length > 0;
     void currentVersion;
     if (!isActive || hasTouched) return;
-    let cancelled = false;
+    const ctrl = new AbortController();
     void (async () => {
       try {
-        const res = await client.functions({ limit: 25 });
-        if (cancelled) return;
+        const res = await client.functions({ limit: 25 }, ctrl.signal);
+        if (ctrl.signal.aborted) return;
         fallbackFunctions = res.functions.filter((f) => !f.external && !isExternalSegmentAddress(f.address, segments));
       } catch {
         // Primary error banner handles connection issues.
       }
     })();
     return () => {
-      cancelled = true;
+      ctrl.abort();
     };
   });
 
@@ -415,6 +332,12 @@
     });
   });
 
+  $effect(() => {
+    return () => {
+      historyCtrl?.abort();
+    };
+  });
+
   // Ensure ops JSON is loaded for the currently selected version.
   $effect(() => {
     if (!active) return;
@@ -425,8 +348,9 @@
     });
   });
 
-  // Sync CodeBlock header dropdown selection back to the slider.
+  // Sync CodeBlock header dropdown selection back to the slider once initialized.
   $effect(() => {
+    if (!variantReady) return;
     const kv = getKeyedVariant(variantKey);
     const match = /^v(\d+)$/.exec(kv);
     if (!match) return;
@@ -439,6 +363,7 @@
 
   // Report scrubber navigation changes back to the parent URL state.
   $effect(() => {
+    if (!active) return;
     const mode = scrubMode;
     const fn = mode === 'diff' ? (diffFnFilter === '__all__' ? '' : diffFnFilter) : activeFnAddr;
     const v = scrubVersion;
@@ -450,107 +375,17 @@
   });
 </script>
 
-<div class="grid grid-cols-1 items-start gap-4 lg:grid-cols-[310px_1fr]">
-  <Card.Root color="bright-black" class="min-w-0">
-    <Card.Header>
-      <Card.Title class="flex items-center justify-between gap-2 text-lg">
-        <span>Timeline</span>
-        <Badge color="yellow">{versions.length} ver</Badge>
-      </Card.Title>
-      <ButtonGroup.Root class="w-full" aria-label="Timeline view">
-        <Button
-          color={sidebarTab === 'versions' ? 'cyan' : 'white'}
-          size="sm"
-          class="flex-1"
-          onclick={() => (sidebarTab = 'versions')}
-        >
-          <HistoryIcon />
-          Versions
-        </Button>
-        <Button
-          color={sidebarTab === 'functions' ? 'cyan' : 'white'}
-          size="sm"
-          class="flex-1"
-          onclick={() => (sidebarTab = 'functions')}
-        >
-          <CodeIcon />
-          Changed ({touchedFunctions.length})
-        </Button>
-      </ButtonGroup.Root>
-    </Card.Header>
-
-    <Card.Content>
-      <div class="space-y-2 p-1">
-        {#if sidebarTab === 'versions'}
-          {#each versionsDesc as v (v.version)}
-            {@const isSelected = selectedVersion === v.version}
-            <Item.Root
-              color={isSelected ? 'cyan' : 'white'}
-              size="sm"
-              pressable
-              class="mb-0 w-full cursor-pointer text-left"
-            >
-              {#snippet child({ props })}
-                <button {...props} type="button" onclick={() => handleSidebarVersionClick(v)}>
-                  <Item.Content>
-                    <Item.Header>
-                      <Item.Title class="font-mono">
-                        <span>v{v.version}</span>
-                        <span>·</span>
-                        <span>{v.operation}</span>
-                      </Item.Title>
-                      {#if v.checkpoint_label}
-                        <Badge color="yellow">{v.checkpoint_label}</Badge>
-                      {/if}
-                    </Item.Header>
-                    <Item.Description>
-                      {v.reason || 'baseline'}
-                    </Item.Description>
-                    <div class="flex flex-wrap items-center gap-1.5 font-mono text-xs">
-                      <Badge color="bright-black">{v.ops_count} ops</Badge>
-                      <Badge color="bright-black">{v.functions.length} fns</Badge>
-                      <span>{v.actor}</span>
-                    </div>
-                  </Item.Content>
-                </button>
-              {/snippet}
-            </Item.Root>
-          {/each}
-        {:else if touchedFunctions.length === 0}
-          <Alert.Root color="blue">
-            <Alert.Title>No function edits yet</Alert.Title>
-            <Alert.Description>Edits applied via /mcp/rw will list changed functions here.</Alert.Description>
-          </Alert.Root>
-        {:else}
-          {#each touchedFunctions as fn (fn.address)}
-            {@const isSelected = sameAddress(activeFnAddr, fn.address)}
-            <Item.Root
-              color={isSelected ? 'cyan' : 'white'}
-              size="sm"
-              pressable
-              class="mb-0 w-full cursor-pointer text-left"
-            >
-              {#snippet child({ props })}
-                <button {...props} type="button" onclick={() => handleSidebarFnClick(fn.address)}>
-                  <Item.Content>
-                    <Item.Header>
-                      <Item.Title class="truncate font-mono">{fn.name}</Item.Title>
-                      <Badge color="yellow">v{fn.latestVersion}</Badge>
-                    </Item.Header>
-                    <div class="flex flex-wrap items-center gap-1.5 font-mono text-xs">
-                      <span>@{fn.address}</span>
-                      <span>·</span>
-                      <span>{fn.versions.map((ver) => `v${ver}`).join(', ')}</span>
-                    </div>
-                  </Item.Content>
-                </button>
-              {/snippet}
-            </Item.Root>
-          {/each}
-        {/if}
-      </div>
-    </Card.Content>
-  </Card.Root>
+<div class="grid grid-cols-1 items-start gap-4 @4xl:grid-cols-[290px_1fr]">
+  <ScrubberSidebar
+    {versionsDesc}
+    {touchedFunctions}
+    {sidebarTab}
+    {selectedVersion}
+    {activeFnAddr}
+    onTabChange={(tab) => (sidebarTab = tab)}
+    onVersionClick={handleSidebarVersionClick}
+    onFnClick={handleSidebarFnClick}
+  />
 
   <div class="flex min-w-0 flex-col gap-4">
     <Card.Root color="bright-black">
@@ -559,12 +394,18 @@
           <Button
             color={scrubMode === 'snapshot' ? 'cyan' : 'white'}
             size="sm"
+            aria-pressed={scrubMode === 'snapshot'}
             onclick={() => switchScrubMode('snapshot')}
           >
             <CodeIcon />
             Snapshot Scrub
           </Button>
-          <Button color={scrubMode === 'diff' ? 'magenta' : 'white'} size="sm" onclick={() => switchScrubMode('diff')}>
+          <Button
+            color={scrubMode === 'diff' ? 'magenta' : 'white'}
+            size="sm"
+            aria-pressed={scrubMode === 'diff'}
+            onclick={() => switchScrubMode('diff')}
+          >
             <GitCompareIcon />
             Diff Range
           </Button>
@@ -607,7 +448,6 @@
                 onValueChange={(value) => {
                   if (value) {
                     diffFnFilter = value;
-                    scheduleRangeDiff(rangeFrom, rangeTo, value, true);
                   }
                 }}
               >
@@ -766,99 +606,20 @@
         </Alert.Root>
       {/if}
     {:else}
-      {#if rangeDiffError}
-        <Alert.Root color="red">
-          <Alert.Title>Diff range failed</Alert.Title>
-          <Alert.Description>{rangeDiffError}</Alert.Description>
-        </Alert.Root>
-      {/if}
-
-      {#if rangeDiffLoading && !rangeDiff}
-        <Card.Root color="white">
-          <Card.Content class="flex items-center gap-3 py-8">
-            <Spinner color="magenta" />
-            <span class="font-mono text-sm">Computing cumulative diff...</span>
-          </Card.Content>
-        </Card.Root>
-      {:else if rangeDiff && rangeDiff.diffs.length > 0}
-        <div class="space-y-4">
-          {#each rangeDiff.diffs as diff (diff.function_address)}
-            <CodeBlock
-              color="yellow"
-              headerColor="magenta"
-              lang="diff"
-              title={`${diff.function_name} (${diff.function_address}) · v${rangeDiff.from} → v${rangeDiff.to}`}
-              code={diff.diff || '(no pseudocode changes)'}
-              shiki={SHIKI_CONFIG}
-              copy
-              download={`${diff.function_name}-v${rangeDiff.from}-v${rangeDiff.to}.diff`}
-            />
-          {/each}
-        </div>
-      {:else}
-        <Alert.Root color="blue">
-          <Alert.Title>No differences between v{rangeFrom} and v{rangeTo}</Alert.Title>
-          <Alert.Description>Drag the range thumbs below or pick another preset.</Alert.Description>
-        </Alert.Root>
-      {/if}
-
-      <Card.Root color="white">
-        <Card.Content class="space-y-4">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <div class="flex flex-wrap items-center gap-2 font-mono text-xs">
-              <Badge color="magenta">v{rangeFrom} → v{rangeTo}</Badge>
-              {#if rangeDiffLoading}
-                <Spinner color="magenta" />
-              {/if}
-            </div>
-
-            <div class="flex flex-wrap items-center gap-1.5">
-              <Button
-                color="blue"
-                size="sm"
-                disabled={maxVersion <= 0}
-                onclick={() => applyRangePreset(Math.max(0, maxVersion - 1), maxVersion)}
-              >
-                Prev → Latest
-              </Button>
-              <Button
-                color="yellow"
-                size="sm"
-                disabled={maxVersion <= 0}
-                onclick={() => applyRangePreset(0, maxVersion)}
-              >
-                v0 → Latest
-              </Button>
-              <Button
-                color="cyan"
-                size="sm"
-                disabled={selectedVersion <= 0}
-                onclick={() => applyRangePreset(Math.max(0, selectedVersion - 1), selectedVersion)}
-              >
-                Step v{selectedVersion}
-              </Button>
-            </div>
-          </div>
-
-          <div class="py-1">
-            <Slider
-              color="magenta"
-              min={0}
-              max={Math.max(1, maxVersion)}
-              step={1}
-              disabled={maxVersion <= 0}
-              value={[rangeFrom, rangeTo]}
-              aria-label="Scrub diff version range"
-              onValueChange={handleRangeDrag}
-              onValueCommit={handleRangeCommit}
-            >
-              {#snippet children(hoverVer)}
-                <span>{formatVersionLabel(hoverVer)}</span>
-              {/snippet}
-            </Slider>
-          </div>
-        </Card.Content>
-      </Card.Root>
+      <ScrubberDiffView
+        {client}
+        {maxVersion}
+        {selectedVersion}
+        {diffFnFilter}
+        {rangeFrom}
+        {rangeTo}
+        {formatVersionLabel}
+        onRangeChange={(from, to) => {
+          rangeFrom = from;
+          rangeTo = to;
+          selectedVersion = to;
+        }}
+      />
     {/if}
 
     <Card.Root color="bright-black">
@@ -877,7 +638,7 @@
             </div>
             <Collapsible.Trigger>
               {#snippet child({ props })}
-                <Button {...props} tabindex={0} color="yellow" size="sm">
+                <Button {...props} color="yellow" size="sm">
                   {opsOpen ? 'Hide' : 'Show'} operations ({activeVersionSummary?.ops_count ?? 0})
                 </Button>
               {/snippet}

@@ -4,10 +4,12 @@ import { describe, it } from 'node:test';
 import {
   ApiRequestError,
   buildFunctionTimeline,
+  buildMultiServerQuery,
   buildNavUrl,
   buildServerQuery,
   classifyEntryPoint,
   collectTouchedFunctions,
+  createGhidraClient,
   findSegmentForAddress,
   formatDisassembly,
   formatRouteError,
@@ -16,6 +18,7 @@ import {
   isReadableAddress,
   isSegmentReadable,
   normalizeTarget,
+  parseInitialTargets,
   parseNavState,
   parseSseBlock,
   removeSavedServer,
@@ -441,5 +444,178 @@ describe('address classification, timeline renames, and SSE framing', () => {
       formatRouteError('/api/v1/memory', new ApiRequestError('Unmapped memory', 404, 'NOT_FOUND')),
       'Unmapped memory',
     );
+  });
+
+  it('deduplicates equivalent hex formats in collectTouchedFunctions', () => {
+    const touched = collectTouchedFunctions([
+      summary(1, 'apply_edits', [{ addr: '0x401100', name: 'old_name' }]),
+      summary(2, 'apply_edits', [{ addr: '00401100', name: 'new_name' }]),
+    ]);
+    assert.equal(touched.length, 1);
+    assert.equal(touched[0].name, 'new_name');
+    assert.deepEqual(touched[0].versions, [1, 2]);
+  });
+
+  it('parses and serializes single and multi-server URL targets', () => {
+    assert.deepEqual(parseInitialTargets('?port=32001'), ['32001']);
+    assert.deepEqual(parseInitialTargets('?api=https%3A%2F%2Fghidra.local%3A8443'), ['https://ghidra.local:8443']);
+    assert.deepEqual(parseInitialTargets('?port=32001&port=32002&api=https%3A%2F%2Fhost%3A8443'), [
+      '32001',
+      '32002',
+      'https://host:8443',
+    ]);
+    assert.deepEqual(parseInitialTargets('?port=32001&new=1'), []);
+
+    const query = buildMultiServerQuery(['32001', 'http://127.0.0.1:32002', 'https://host:8443/mcp/ro']);
+    assert.equal(query, '?port=32001&port=32002&api=https%3A%2F%2Fhost%3A8443');
+    assert.deepEqual(parseInitialTargets(query), ['32001', '32002', 'https://host:8443']);
+  });
+
+  it('aborts client requests when sessionSignal is aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const client = createGhidraClient('http://127.0.0.1:1', '', controller.signal);
+    await assert.rejects(
+      () => client.health(),
+      (err: unknown) => err instanceof DOMException && err.name === 'AbortError',
+    );
+  });
+});
+
+describe('createGhidraClient HTTP and SSE', () => {
+  it('sends bearer auth headers and maps 401/403/JSON ApiError payloads', async () => {
+    const origFetch = globalThis.fetch;
+    const seenAuth: Array<string | null> = [];
+    let mode: 'ok' | '401' | '403' | '404json' = 'ok';
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      seenAuth.push(headers.get('Authorization'));
+      if (mode === '401') return new Response('{}', { status: 401 });
+      if (mode === '403') return new Response('{}', { status: 403 });
+      if (mode === '404json') {
+        return new Response(JSON.stringify({ ok: false, code: 'TYPE_NOT_FOUND', error: 'Missing type' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true, status: 'ready' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      const client = createGhidraClient('http://127.0.0.1:43299', ' secret-tok ');
+      const health = await client.health();
+      assert.equal(health.status, 'ready');
+      assert.equal(seenAuth[0], 'Bearer secret-tok');
+
+      mode = '401';
+      await assert.rejects(
+        () => client.status(),
+        (err: unknown) => err instanceof ApiRequestError && err.status === 401 && err.code === 'UNAUTHORIZED',
+      );
+
+      mode = '403';
+      await assert.rejects(
+        () => client.status(),
+        (err: unknown) => err instanceof ApiRequestError && err.status === 403 && err.code === 'FORBIDDEN',
+      );
+
+      mode = '404json';
+      await assert.rejects(
+        () => client.types({ query: 'Nope' }),
+        (err: unknown) =>
+          err instanceof ApiRequestError &&
+          err.status === 404 &&
+          err.code === 'TYPE_NOT_FOUND' &&
+          err.message === 'Missing type',
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('streams chunked SSE frames and stops cleanly when aborted', async () => {
+    const origFetch = globalThis.fetch;
+    const sessionCtrl = new AbortController();
+    const states: string[] = [];
+    const frames: Array<{ event: string; data: Record<string, unknown> }> = [];
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(': keepalive\n\nevent: status\ndata: {"state":"ready","version":2}\n\n'));
+          controller.enqueue(
+            encoder.encode('event: version_created\ndata: {"version":3,"operation":"apply_edits"}\n\n'),
+          );
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              try {
+                controller.close();
+              } catch {
+                // Already closed.
+              }
+            },
+            { once: true },
+          );
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      const client = createGhidraClient('http://127.0.0.1:43299', '', sessionCtrl.signal);
+      const loopCtrl = new AbortController();
+      await client.subscribeEvents(
+        (frame) => {
+          frames.push(frame);
+          if (frames.length === 2) sessionCtrl.abort();
+        },
+        (state) => states.push(state),
+        loopCtrl.signal,
+      );
+
+      assert.deepEqual(states, ['connecting', 'connected']);
+      assert.deepEqual(frames, [
+        { event: 'status', data: { state: 'ready', version: 2 } },
+        { event: 'version_created', data: { version: 3, operation: 'apply_edits' } },
+      ]);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('stops retrying SSE and emits auth_error on HTTP 401', async () => {
+    const origFetch = globalThis.fetch;
+    let calls = 0;
+    const states: Array<{ state: string; detail?: string }> = [];
+
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response('{}', { status: 401 });
+    }) as unknown as typeof fetch;
+
+    try {
+      const client = createGhidraClient('http://127.0.0.1:43299');
+      await client.subscribeEvents(
+        () => {},
+        (state, detail) => states.push({ state, detail }),
+        new AbortController().signal,
+      );
+      assert.equal(calls, 1);
+      assert.equal(states.length, 2);
+      assert.equal(states[0].state, 'connecting');
+      assert.equal(states[1].state, 'auth_error');
+      assert.match(states[1].detail ?? '', /Unauthorized/i);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 });
