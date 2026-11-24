@@ -3,3 +3,4 @@
 .claude/skills
 .audit
 artifacts/build/
+.tmp/

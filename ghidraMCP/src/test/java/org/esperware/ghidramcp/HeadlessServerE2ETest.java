@@ -581,13 +581,13 @@ class HeadlessServerE2ETest {
         assertTrue(Files.isRegularFile(v0.resolve("symbols.json")));
         assertTrue(Files.isRegularFile(v0.resolve("functions.jsonl")));
         assertTrue(Files.isRegularFile(v0.resolve("callgraph.jsonl")));
-        assertTrue(Files.isRegularFile(v0.resolve("src/readability-fixture.c")));
+        assertFalse(Files.exists(v0.resolve("src/readability-fixture.c")));
         assertFalse(Files.exists(v0.resolve("src/_unmapped.c")));
-        assertTrue(Files.isRegularFile(v0.resolve("src/_sec/init.c")));
-        assertTrue(Files.isDirectory(v0.resolve("src/_text")));
-        try (var textFiles = Files.list(v0.resolve("src/_text"))) {
-            assertTrue(textFiles.anyMatch(p -> p.toString().endsWith(".c")), "Expected .c files in src/_text");
-        }
+        assertFalse(Files.exists(v0.resolve("src/_sec")));
+        assertFalse(Files.exists(v0.resolve("src/_text")));
+        assertTrue(Files.isRegularFile(v0.resolve("src/001129.c")));
+        assertTrue(Files.isRegularFile(v0.resolve("src/001153.c")));
+        assertTrue(Files.isRegularFile(v0.resolve("src/00119a.c")));
         assertFalse(Files.exists(v0.resolve("types.json")));
         assertFalse(Files.exists(v0.resolve("source_map.jsonl")));
         assertFalse(Files.exists(v0.resolve("functions")));
@@ -600,16 +600,13 @@ class HeadlessServerE2ETest {
         assertTrue(Files.readString(v0.resolve("symbols.json"), StandardCharsets.UTF_8).contains("probe_state"),
                 "symbols.json missing probe_state");
 
-        String fixtureSrc = Files.readString(v0.resolve("src/readability-fixture.c"), StandardCharsets.UTF_8);
-        assertTrue(fixtureSrc.startsWith("#include \"../types.h\"\n"), fixtureSrc);
-        int mixIdx = fixtureSrc.indexOf("mix(");
-        int transformIdx = fixtureSrc.indexOf("transform(");
-        int mainIdx = fixtureSrc.indexOf("main(");
-        assertTrue(mixIdx > 0 && transformIdx > mixIdx && mainIdx > transformIdx,
-                "Expected mix, transform, main sorted by line in src/readability-fixture.c:\n" + fixtureSrc);
-        assertTrue(fixtureSrc.contains("readability-fixture.c:"), fixtureSrc);
+        String mainSrc = Files.readString(v0.resolve("src/00119a.c"), StandardCharsets.UTF_8);
+        assertTrue(mainSrc.startsWith("#include \"../types.h\"\n"), mainSrc);
+        assertTrue(mainSrc.contains("int main("), mainSrc);
+        assertTrue(mainSrc.contains("readability-fixture.c:26-30"), mainSrc);
 
         Map<String, JsonObject> fnRows = new HashMap<>();
+        Set<String> exportedSourceFiles = new HashSet<>();
         for (String line : Files.readAllLines(v0.resolve("functions.jsonl"), StandardCharsets.UTF_8)) {
             if (line.isBlank()) continue;
             JsonObject row = JsonParser.parseString(line).getAsJsonObject();
@@ -619,14 +616,27 @@ class HeadlessServerE2ETest {
             assertFalse(row.has("pseudocode"));
             assertNotEquals("00405000", row.get("entry_address").getAsString(),
                     "EXTERNAL stub should not be exported in functions.jsonl");
+            String entryOffset = row.get("entry_offset").getAsString();
+            String sourceFile = row.get("src_file").getAsString();
+            assertEquals("src/" + entryOffset + ".c", sourceFile);
+            assertTrue(Files.isRegularFile(v0.resolve(sourceFile)), "Missing function source " + sourceFile);
+            assertTrue(exportedSourceFiles.add(sourceFile), "Duplicate function source file " + sourceFile);
             fnRows.put(row.get("name").getAsString(), row);
         }
         assertFalse(fnRows.containsKey("__libc_start_main"),
                 "EXTERNAL stub should not be exported in functions.jsonl");
+        assertEquals(fnRows.size(), exportedSourceFiles.size());
         for (String expectedFn : List.of("mix", "transform", "main")) {
             JsonObject row = fnRows.get(expectedFn);
             assertNotNull(row, "Missing function in functions.jsonl: " + expectedFn);
-            assertEquals("src/readability-fixture.c", row.get("src_file").getAsString());
+            String expectedOffset = switch (expectedFn) {
+                case "mix" -> "001129";
+                case "transform" -> "001153";
+                case "main" -> "00119a";
+                default -> throw new AssertionError(expectedFn);
+            };
+            assertEquals(expectedOffset, row.get("entry_offset").getAsString());
+            assertEquals("src/" + expectedOffset + ".c", row.get("src_file").getAsString());
             assertEquals("complete", row.get("decompile_status").getAsString());
             assertTrue(row.getAsJsonArray("variables").size() > 0, "Expected variables for " + expectedFn);
             assertTrue(row.getAsJsonArray("lines").size() > 0, "Expected DWARF lines for " + expectedFn);
@@ -686,6 +696,20 @@ class HeadlessServerE2ETest {
         assertEquals(expV0, JsonParser.parseString(repeatedExport.body()).getAsJsonObject());
         assertEquals(publishedAt, Files.getLastModifiedTime(manifestPath));
 
+        JsonObject legacyManifest = JsonParser.parseString(Files.readString(manifestPath, StandardCharsets.UTF_8))
+                .getAsJsonObject();
+        legacyManifest.remove("export_layout_version");
+        Files.writeString(manifestPath, legacyManifest.toString(), StandardCharsets.UTF_8);
+        HttpResponse<String> refreshedExport = HTTP.send(HttpRequest.newBuilder(URI.create(exportUrl))
+                .header("Authorization", "Bearer exp-rw")
+                .timeout(Duration.ofSeconds(30))
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, refreshedExport.statusCode(), refreshedExport.body());
+        JsonObject refreshedManifest = JsonParser.parseString(Files.readString(manifestPath, StandardCharsets.UTF_8))
+                .getAsJsonObject();
+        assertEquals(2, refreshedManifest.get("export_layout_version").getAsInt());
+        publishedAt = Files.getLastModifiedTime(manifestPath);
+
         Path typesPath = manifestPath.resolveSibling("types.h");
         Path heldTypes = tmpRoot.resolve("api-export-types.h");
         Files.move(typesPath, heldTypes);
@@ -706,16 +730,32 @@ class HeadlessServerE2ETest {
         StreamableMcpClient rw = new StreamableMcpClient(server.baseUrl + "/mcp/rw", "export-rw", "exp-rw");
         String targetAddr = rw.callOk("search_code", Map.of("query", "7feb352d", "scope", "pseudocode"))
                 .getAsJsonArray("matches").get(0).getAsJsonObject().get("address").getAsString();
-        String expectedSrcFile = "src/_text/" + targetAddr + ".c";
+        String targetOffset = String.format("%06x", Long.parseLong(targetAddr, 16) - 0x00400000L);
+        String expectedSrcFile = "src/" + targetOffset + ".c";
         Path strippedV0 = tmpRoot.resolve("api-export/code/v0");
         assertFalse(Files.exists(strippedV0.resolve("src/_unmapped.c")));
         assertTrue(Files.isRegularFile(strippedV0.resolve(expectedSrcFile)), "Missing " + expectedSrcFile + " in v0");
         assertFalse(Files.readString(strippedV0.resolve(expectedSrcFile), StandardCharsets.UTF_8).contains("mix_renamed"));
 
+        JsonObject entryDis = rw.callOk("disassemble", Map.of("target", "entry", "max_instructions", 30));
+        String mainAddr = null;
+        for (JsonElement element : entryDis.getAsJsonArray("instructions")) {
+            JsonObject instruction = element.getAsJsonObject();
+            String mnemonic = instruction.get("mnemonic").getAsString();
+            String operands = instruction.get("operands").getAsString();
+            if ("MOV".equals(mnemonic) && operands.startsWith("RDI,0x")) {
+                mainAddr = operands.substring("RDI,".length()).trim();
+                break;
+            }
+        }
+        assertNotNull(mainAddr, "Expected main callback address in entry disassembly");
+
         rw.callOk("apply_edits", Map.of(
                 "expected_version", 0,
-                "reason", "rename mix for export check",
-                "edits", List.of(Map.of("op", "rename_function", "target", targetAddr, "new_name", "mix_renamed"))));
+                "reason", "define main and rename mix for export check",
+                "edits", List.of(
+                        Map.of("op", "create_function", "target", mainAddr, "name", "main"),
+                        Map.of("op", "rename_function", "target", targetAddr, "new_name", "mix_renamed"))));
 
         HttpResponse<String> expV1Resp = HTTP.send(HttpRequest.newBuilder(URI.create(exportUrl))
                 .header("Authorization", "Bearer exp-rw")
@@ -729,6 +769,9 @@ class HeadlessServerE2ETest {
         assertFalse(Files.exists(strippedV1.resolve("src/_unmapped.c")));
         assertTrue(Files.readString(strippedV1.resolve("functions.jsonl"), StandardCharsets.UTF_8).contains("mix_renamed"));
         assertTrue(Files.readString(strippedV1.resolve(expectedSrcFile), StandardCharsets.UTF_8).contains("mix_renamed"));
+        assertTrue(Files.isRegularFile(strippedV1.resolve("src/00119a.c")),
+                "Expected export to recover main from the __libc_start_main callback");
+        assertTrue(Files.readString(strippedV1.resolve("src/00119a.c"), StandardCharsets.UTF_8).contains("main("));
         server.shutdownAndAwait("exp-rw");
     }
 

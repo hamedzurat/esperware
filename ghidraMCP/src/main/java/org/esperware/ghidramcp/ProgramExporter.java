@@ -54,6 +54,7 @@ import java.util.concurrent.Future;
 /** Exports a zero-duplication Ghidra pseudocode and metadata snapshot into &lt;work-dir&gt;/code/v&lt;version&gt;/. */
 final class ProgramExporter {
     private static final int DECOMPILE_TIMEOUT_SEC = 30;
+    private static final int EXPORT_LAYOUT_VERSION = 2;
     private static final Set<String> REQUIRED_FILES = Set.of(
             "manifest.json", "types.h", "functions.jsonl", "callgraph.jsonl", "symbols.json");
 
@@ -73,8 +74,9 @@ final class ProgramExporter {
     private record FunctionExport(
             Function fn,
             ProgramWorkspace.CachedDecompile decompile,
+            String entryOffset,
             String primaryRawSource,
-            String mappedSrcFile,
+            String srcFile,
             int minLine,
             int maxLine,
             List<LineSpan> lines) {}
@@ -98,7 +100,8 @@ final class ProgramExporter {
             Path codeRoot = workDir.resolve("code");
             Path targetDir = codeRoot.resolve("v" + version);
             if (Files.exists(targetDir, LinkOption.NOFOLLOW_LINKS)) {
-                return reuseSnapshot(targetDir, version);
+                Map<String, Object> reused = reuseSnapshot(targetDir, version);
+                if (reused != null) return reused;
             }
 
             Program program = ws.program();
@@ -106,21 +109,6 @@ final class ProgramExporter {
             List<ProgramWorkspace.CachedDecompile> decompiled = decompileAll(functions);
 
             SourceFileManager sfm = program.getSourceFileManager();
-            List<String> rawPrimaryFiles = new ArrayList<>(functions.size());
-            List<List<SourceMapEntry>> rawEntriesPerFn = new ArrayList<>(functions.size());
-            Set<String> distinctRawSources = new LinkedHashSet<>();
-
-            for (Function fn : functions) {
-                List<SourceMapEntry> entries = collectSourceEntries(sfm, fn);
-                rawEntriesPerFn.add(entries);
-                String primary = pickPrimarySource(fn, entries);
-                rawPrimaryFiles.add(primary);
-                if (primary != null) distinctRawSources.add(primary);
-            }
-
-            SourcePaths paths = new SourcePaths();
-            Map<String, String> sourceMap = normalizeSourcePaths(distinctRawSources, paths);
-            Map<String, String> fallbackPaths = new HashMap<>();
             List<FunctionExport> fnExports = new ArrayList<>(functions.size());
             Map<String, List<FunctionExport>> bySourceFile = new LinkedHashMap<>();
             int decompiledCount = 0;
@@ -129,16 +117,10 @@ final class ProgramExporter {
                 Function fn = functions.get(i);
                 ProgramWorkspace.CachedDecompile dec = decompiled.get(i);
                 if ("complete".equals(dec.status())) decompiledCount++;
-                String primary = rawPrimaryFiles.get(i);
-                String srcFile = primary != null ? sourceMap.get(primary) : null;
-                if (srcFile == null) {
-                    String candidate = classifyFallbackSource(
-                            fallbackNamespaceParts(fn),
-                            sectionName(program, fn),
-                            fn.getEntryPoint().toString());
-                    srcFile = fallbackPaths.computeIfAbsent(candidate, paths::reserve);
-                }
-                List<SourceMapEntry> entries = rawEntriesPerFn.get(i);
+                List<SourceMapEntry> entries = collectSourceEntries(sfm, fn);
+                String primary = pickPrimarySource(fn, entries);
+                String entryOffset = functionOffset(program, fn);
+                String srcFile = "src/" + entryOffset + ".c";
                 List<LineSpan> lines = new ArrayList<>(entries.size());
                 int minLine = Integer.MAX_VALUE;
                 int maxLine = Integer.MIN_VALUE;
@@ -154,7 +136,7 @@ final class ProgramExporter {
                         maxLine = Math.max(maxLine, ln);
                     }
                 }
-                FunctionExport fx = new FunctionExport(fn, dec, primary, srcFile, minLine, maxLine, lines);
+                FunctionExport fx = new FunctionExport(fn, dec, entryOffset, primary, srcFile, minLine, maxLine, lines);
                 fnExports.add(fx);
                 bySourceFile.computeIfAbsent(srcFile, k -> new ArrayList<>()).add(fx);
             }
@@ -184,11 +166,12 @@ final class ProgramExporter {
                 counts.put("source_files", srcFileCount);
 
                 Map<String, Object> manifest = new LinkedHashMap<>(inspect.collectProgramMetadata(version));
+                manifest.put("export_layout_version", EXPORT_LAYOUT_VERSION);
                 manifest.put("counts", counts);
                 manifest.put("files", files);
                 Files.writeString(stageDir.resolve("manifest.json"), prettyGson.toJson(manifest) + "\n", StandardCharsets.UTF_8);
 
-                Files.move(stageDir, targetDir, StandardCopyOption.ATOMIC_MOVE);
+                publishSnapshot(stageDir, targetDir, codeRoot, version);
                 return exportResult(targetDir, version, counts, files);
             } finally {
                 deleteTreeBestEffort(stageDir);
@@ -219,6 +202,12 @@ final class ProgramExporter {
     private static String sectionName(Program program, Function fn) {
         MemoryBlock block = program.getMemory().getBlock(fn.getEntryPoint());
         return block == null ? null : block.getName();
+    }
+
+    private static String functionOffset(Program program, Function fn) {
+        long offset = fn.getEntryPoint().subtract(program.getImageBase());
+        String hex = Long.toHexString(offset);
+        return "0".repeat(Math.max(0, 6 - hex.length())) + hex;
     }
 
     static String classifyFallbackSource(List<String> namespaceParts, String sectionName, String entryAddress) {
@@ -396,6 +385,7 @@ final class ProgramExporter {
                 Function fn = fx.fn();
                 Map<String, Object> row = new LinkedHashMap<>();
                 row.put("entry_address", fn.getEntryPoint().toString());
+                row.put("entry_offset", fx.entryOffset());
                 List<Map<String, String>> ranges = new ArrayList<>();
                 for (AddressRange r : fn.getBody()) {
                     ranges.add(Map.of(
@@ -411,7 +401,7 @@ final class ProgramExporter {
                 row.put("is_thunk", fn.isThunk());
                 String comment = fn.getComment();
                 if (comment != null && !comment.isEmpty()) row.put("comment", comment);
-                row.put("src_file", fx.mappedSrcFile());
+                row.put("src_file", fx.srcFile());
                 row.put("decompile_status", fx.decompile().status());
                 if (fx.decompile().error() != null) row.put("decompile_error", fx.decompile().error());
                 row.put("variables", fx.decompile().variables());
@@ -577,7 +567,35 @@ final class ProgramExporter {
             String missing = listedFiles.stream().min(String::compareTo).orElseThrow();
             throw incompleteExport(version, "missing " + missing);
         }
+        JsonElement layoutVersion = manifest.get("export_layout_version");
+        if (layoutVersion == null || !layoutVersion.isJsonPrimitive()
+                || !layoutVersion.getAsJsonPrimitive().isNumber()
+                || layoutVersion.getAsInt() != EXPORT_LAYOUT_VERSION) {
+            return null;
+        }
         return exportResult(targetDir, version, counts, files);
+    }
+
+    private static void publishSnapshot(Path stageDir, Path targetDir, Path codeRoot, long version)
+            throws IOException {
+        if (!Files.exists(targetDir, LinkOption.NOFOLLOW_LINKS)) {
+            Files.move(stageDir, targetDir, StandardCopyOption.ATOMIC_MOVE);
+            return;
+        }
+
+        Path previousDir = codeRoot.resolve("previous-v" + version + "-" + UUID.randomUUID());
+        Files.move(targetDir, previousDir, StandardCopyOption.ATOMIC_MOVE);
+        try {
+            Files.move(stageDir, targetDir, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException publishFailure) {
+            try {
+                Files.move(previousDir, targetDir, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException restoreFailure) {
+                publishFailure.addSuppressed(restoreFailure);
+            }
+            throw publishFailure;
+        }
+        deleteTreeBestEffort(previousDir);
     }
 
     private static ApiError incompleteExport(long version, String detail) {
