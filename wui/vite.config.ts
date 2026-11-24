@@ -4,8 +4,11 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vite';
 
+import { createLocalSnapshotPlugin } from './src/lib/local-snapshot-fs.ts';
+
 export default defineConfig({
   plugins: [
+    createLocalSnapshotPlugin(),
     tailwindcss(),
     sveltekit({
       compilerOptions: {
