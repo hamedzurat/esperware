@@ -1,0 +1,154 @@
+# Build profiles for the dataset binaries (see build_dataset.py).
+# Add a profile only if it changes what Ghidra decompiles, not just the bytes.
+# "distro" = the flags Linux distributions (Debian, Fedora, Arch, ...) build their packages with.
+
+# Put before every profile's flags; a profile's own flags override these.
+# Compilers are built with different defaults per distro (Ubuntu turns on PIE, stack
+# protector, FORTIFY and CET; Arch only some). Stating every default here makes a
+# profile mean the same thing on every machine.
+common = [
+    "-march=x86-64", "-mtune=generic",
+    "-fno-pie", "-no-pie",
+    "-fno-stack-protector", "-fno-stack-clash-protection",
+    "-U_FORTIFY_SOURCE", "-fcf-protection=none",
+]
+
+# --- what distros actually ship ---
+[[profile]]
+name = "gcc-O2-distro"
+cc = "gcc"
+flags = ["-O2", "-fPIE", "-pie", "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2", "-fcf-protection"]
+
+[[profile]]
+name = "clang-O2-distro"
+cc = "clang"
+flags = ["-O2", "-fPIE", "-pie", "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2", "-fcf-protection"]
+
+# --- unoptimized: everything lives on the stack ---
+[[profile]]
+name = "gcc-O0"
+cc = "gcc"
+flags = ["-O0", "-no-pie", "-fno-stack-protector"]
+
+[[profile]]
+name = "clang-O0"
+cc = "clang"
+flags = ["-O0", "-fPIE", "-pie"]
+
+# --- light optimization, function boundaries kept (the original fixture build) ---
+[[profile]]
+name = "gcc-O1-noinline"
+cc = "gcc"
+flags = ["-O1", "-fno-inline", "-fno-stack-protector", "-no-pie"]
+
+[[profile]]
+name = "clang-O1"
+cc = "clang"
+flags = ["-O1", "-fPIE", "-pie"]
+
+# --- aggressive + AVX2: vectorized loops, heavy inlining ---
+[[profile]]
+name = "gcc-O3-v3"
+cc = "gcc"
+flags = ["-O3", "-march=x86-64-v3", "-fPIE", "-pie"]
+
+[[profile]]
+name = "clang-O3-v3"
+cc = "clang"
+flags = ["-O3", "-march=x86-64-v3", "-fPIE", "-pie"]
+
+[[profile]]
+name = "gcc-O3-unroll"
+cc = "gcc"
+flags = ["-O3", "-funroll-loops", "-no-pie"]
+
+# --- size ---
+[[profile]]
+name = "gcc-Os"
+cc = "gcc"
+flags = ["-Os", "-fPIE", "-pie", "-fstack-protector-strong"]
+
+[[profile]]
+name = "clang-Oz"
+cc = "clang"
+flags = ["-Oz", "-fPIE", "-pie"]
+
+# --- O2 with one visible twist each ---
+[[profile]]
+name = "gcc-O2-fp-nopie"
+cc = "gcc"
+flags = ["-O2", "-fno-omit-frame-pointer", "-no-pie", "-fno-stack-protector"]
+
+[[profile]]
+name = "clang-O2-novec-fp"
+cc = "clang"
+flags = ["-O2", "-fno-vectorize", "-fno-slp-vectorize", "-fno-omit-frame-pointer", "-no-pie"]
+
+[[profile]]
+name = "gcc-O2-fastmath"
+cc = "gcc"
+flags = ["-O2", "-ffast-math", "-fPIE", "-pie"]
+
+# --- current distro flags (Fedora, Arch, Ubuntu 24.04+): frame pointers kept, no PLT ---
+[[profile]]
+name = "gcc-O2-distro-modern"
+cc = "gcc"
+flags = ["-O2", "-fPIE", "-pie", "-fstack-protector-strong", "-fstack-clash-protection", "-D_FORTIFY_SOURCE=3", "-fcf-protection", "-fno-omit-frame-pointer", "-fno-plt", "-Wl,-z,relro,-z,now"]
+
+# --- plain builds that fill gaps in the grid ---
+[[profile]]
+name = "clang-O2"
+cc = "clang"
+flags = ["-O2", "-fPIE", "-pie"]
+
+[[profile]]
+name = "gcc-O1"
+cc = "gcc"
+flags = ["-O1", "-fPIE", "-pie"]
+
+[[profile]]
+name = "clang-Os"
+cc = "clang"
+flags = ["-Os", "-fPIE", "-pie"]
+
+# --- switch as compare chains instead of a jump table ---
+[[profile]]
+name = "gcc-O2-nojumptables"
+cc = "gcc"
+flags = ["-O2", "-fno-jump-tables", "-fPIE", "-pie"]
+
+# --- cross-file inlining: mainly for multi-file programs ---
+[[profile]]
+name = "gcc-O2-lto"
+cc = "gcc"
+flags = ["-O2", "-flto", "-fPIE", "-pie"]
+
+[[profile]]
+name = "clang-O2-lto"
+cc = "clang"
+flags = ["-O2", "-flto", "-fPIE", "-pie"]
+
+# --- libc inside the binary: adds thousands of functions, use on few programs ---
+[[profile]]
+name = "gcc-O2-static"
+cc = "gcc"
+flags = ["-O2", "-static", "-no-pie"]
+
+# --- C++ only ---
+[[profile]]
+name = "gcc-O2-noexcept-nortti"
+cc = "gcc"
+only = "cpp"
+flags = ["-O2", "-fno-exceptions", "-fno-rtti", "-fPIE", "-pie"]
+
+[[profile]]
+name = "clang-O2-libcxx"
+cc = "clang"
+only = "cpp"
+flags = ["-O2", "-stdlib=libc++", "-fPIE", "-pie"]
+
+# --- AVX-512 probe: check what Ghidra makes of it before using it widely ---
+[[profile]]
+name = "gcc-O3-v4"
+cc = "gcc"
+flags = ["-O3", "-march=x86-64-v4", "-fPIE", "-pie"]

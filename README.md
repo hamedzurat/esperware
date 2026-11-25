@@ -7,17 +7,19 @@ Headless Ghidra 12.2 MCP server with versioned edits, read-only subagent endpoin
 - `justfile`: shortcut commands to run, inspect, and stop binary containers and serve the WebUI.
 - `ghidraMCP/`: headless Java Ghidra server, container build, and JUnit 5 test suite. See [the architecture notes](ghidraMCP/README.md) for internals.
 - `wui/`: SvelteKit static WebUI for version scrubbing, unified diffs, function inspection, symbol and type lookup, code search, and memory dumps.
-- `artifacts/`: C test sources and a `justfile` that builds `-O1` stripped and unstripped ELF binaries into `artifacts/build/`.
+- `artifacts/`: C/C++ sources under `codes/` and a `justfile` that builds them with several compiler profiles into stripped and unstripped ELF binaries under `artifacts/build/dataset/`.
 
 ## Build test binaries
 
-Run `just` inside `artifacts/` to compile every `.c` file at `-O1` (`-fno-inline`) into both `build/<name>.unstripped.elf` (with DWARF) and `build/<name>.stripped.elf`:
+Put each program's `.c`/`.cpp` files in `artifacts/codes/<name>/`; all files in one directory are linked into one binary. Then build:
 
 ```sh
 just artifacts
 ```
 
-Or run `cd artifacts && just one <name>` for one C file, or `cd artifacts && just clean` to remove `artifacts/build/`.
+Each program is built into `artifacts/build/dataset/<name>/<profile>.unstripped.elf` (with DWARF) and `<profile>.stripped.elf`, and recorded in `build/dataset/manifest.jsonl`. Compiler profiles live in `artifacts/profiles.toml`; `artifacts/dataset.toml` sets which profiles each program gets.
+
+Inside `artifacts/`, `just dataset --all` builds every profile, `just dataset <profile>...` builds named ones, `-p <glob>` limits the programs, and `just clean` removes `artifacts/build/`.
 
 ## Quickstart with containers
 
@@ -30,13 +32,13 @@ just image
 Start a server with a binary. Install Python 3 and `jq` to use `just run` and `just resume`. `just run` tries ports above `32000` and prints the port when the server is ready. Use a different state directory for each running server.
 
 ```sh
-just run ./artifacts/build/readability-fixture.stripped.elf
+just run ./artifacts/build/dataset/test/gcc-O1-noinline.stripped.elf
 ```
 
 By default, `just run` stores the project and SQLite history in `/tmp/esperware-<time>-readability-fixture.stripped/run`. It stores the SHA-256 baseline cache in the matching `cache` directory. Pass a directory as the second argument to choose a different state directory:
 
 ```sh
-just run ./artifacts/build/readability-fixture.stripped.elf /tmp/my-run
+just run ./artifacts/build/dataset/test/gcc-O1-noinline.stripped.elf /tmp/my-run
 ```
 
 The readiness output contains the server endpoints. Each run gets its own port and container name, so you can run multiple binaries at once. Use the reported port with the management commands:
@@ -48,7 +50,7 @@ just logs <port>               # View container logs
 just stop <port>               # Graceful shutdown
 just resume /tmp/my-run <port> # Reopen existing project and version history
 just wui [port] [ui_port]      # Serve the WebUI and print its URL for <port>, default UI port 4173
-just dump ./artifacts/build/readability-fixture.unstripped.elf /tmp/my-dump  # Export the current version to <dir>/run/code/v<N>
+just dump ./artifacts/build/dataset/test/gcc-O1-noinline.unstripped.elf /tmp/my-dump  # Export the current version to <dir>/run/code/v<N>
 ```
 
 A new workspace exports `v0`. An existing workspace exports its current version. Exporting the same version again reuses its published snapshot and checks that all listed files still exist. If the snapshot is incomplete, move its version directory out of `code/` before retrying.
@@ -69,7 +71,7 @@ Requires JDK 25 and Ghidra 12.2 (`GHIDRA_INSTALL_DIR` or `ghidraMCP/.local/ghidr
 cd ghidraMCP
 just build
 ./bin/ghidra-mcp \
-	--binary ../artifacts/build/readability-fixture.stripped.elf \
+	--binary ../artifacts/build/dataset/test/gcc-O1-noinline.stripped.elf \
 	--work-dir /tmp/run-01 \
 	--cache-dir /tmp/ghidra-cache \
 	--port 0

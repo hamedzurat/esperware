@@ -185,9 +185,9 @@ wui port="" ui_port="4173":
     echo "Serving WebUI at $url"
     exec bun run preview -- --host 127.0.0.1 --port "$ui_port" --strictPort
 
-# Build all C test binaries in artifacts/
+# Build the dataset binaries in artifacts/
 artifacts:
-    @just -f artifacts/justfile build
+    @just -f artifacts/justfile dataset
 
 # Build ghidra-mcp:local container image
 image:

@@ -1,0 +1,60 @@
+# Which profiles (from profiles.toml) each program in codes/ gets.
+# `match` is a glob on the directory name; the first matching rule wins.
+# A program that matches no rule gets every profile.
+# `per_program = N` gives each program N profiles from the list instead of all of them.
+# Which N is fixed by the program's name: not random, and stable when programs are added.
+
+# The E2E test fixture.
+[[rule]]
+match = "test"
+profiles = ["gcc-O1-noinline"]
+
+# The comparison program: every profile, to see how each one changes the output.
+[[rule]]
+match = "everything"
+profiles = [
+    "gcc-O2-distro",
+    "clang-O2-distro",
+    "gcc-O0",
+    "clang-O0",
+    "gcc-O1-noinline",
+    "clang-O1",
+    "gcc-O3-v3",
+    "clang-O3-v3",
+    "gcc-O3-unroll",
+    "gcc-Os",
+    "clang-Oz",
+    "gcc-O2-fp-nopie",
+    "clang-O2-novec-fp",
+    "gcc-O2-fastmath",
+    "gcc-O2-distro-modern",
+    "clang-O2",
+    "gcc-O1",
+    "clang-Os",
+    "gcc-O2-nojumptables",
+    "gcc-O2-lto",
+    "clang-O2-lto",
+    "gcc-O2-static",
+    "gcc-O2-noexcept-nortti",
+    "clang-O2-libcxx",
+    "gcc-O3-v4",
+]
+
+# Example tiers, keyed on a name prefix. Uncomment and adjust once the programs exist.
+#
+# [[rule]]                      # ~200 single-concept programs: wide, they are cheap
+# match = "concept-*"
+# profiles = ["gcc-O0", "gcc-O2-distro", "clang-O2-distro", "gcc-O3-v3"]
+#
+# [[rule]]                      # ~1000 mixed programs: 2 each, spread over the list
+# match = "mix-*"
+# per_program = 2
+# profiles = ["gcc-O2-distro", "clang-O2-distro", "gcc-O1-noinline", "clang-O1", "gcc-Os", "clang-Oz", "gcc-O3-v3", "clang-O3-v3"]
+#
+# [[rule]]                      # ~20 mid-size programs
+# match = "mid-*"
+# profiles = ["gcc-O2-distro", "clang-O2-distro", "gcc-O3-v3"]
+#
+# [[rule]]                      # ~2 large codebases: each profile is a long teacher run
+# match = "big-*"
+# profiles = ["gcc-O2-distro"]

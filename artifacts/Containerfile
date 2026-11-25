@@ -1,0 +1,31 @@
+# The machine every dataset binary is built on: Arch Linux with its stock, current
+# GCC and Clang, glibc, libstdc++, libc++ and binutils (generic x86-64 packages).
+#
+# Everything is pinned, so the image has the same toolchain whenever and wherever it
+# is built: the base image by digest, the packages by an Arch Linux Archive date.
+#
+# To update the toolchain: set DATE to a newer day, set the FROM digest to the one
+# `podman pull docker.io/archlinux/archlinux:base` prints, then run `just image`.
+# Binaries built before and after an update differ, so rebuild the whole dataset.
+FROM docker.io/archlinux/archlinux:base@sha256:c3581e5f269b95678eb55477592a7c030486bfdcb9b00ea75469c428d99cdf61
+
+# Must not be older than the base image (pacman would have to downgrade it).
+ARG DATE=2026/11/24
+
+# The archive is slow; without --disable-download-timeout pacman gives up after 10 s.
+RUN echo "Server = https://archive.archlinux.org/repos/${DATE}/\$repo/os/\$arch" > /etc/pacman.d/mirrorlist \
+ && pacman -Syyuu --noconfirm --disable-download-timeout \
+ && pacman -S --noconfirm --needed --disable-download-timeout \
+      gcc glibc binutils \
+      clang llvm-libs libc++ libc++abi \
+      python \
+ && pacman -Scc --noconfirm
+
+# Fail the image build if a compiler or a runtime a profile needs is missing.
+RUN gcc --version && clang --version && ld --version \
+ && printf '#include <iostream>\nint main(){std::cout<<1;}\n' > /tmp/t.cpp \
+ && g++ -static /tmp/t.cpp -o /tmp/a && g++ -flto /tmp/t.cpp -o /tmp/b \
+ && clang++ -stdlib=libc++ /tmp/t.cpp -o /tmp/c && clang++ -flto /tmp/t.cpp -o /tmp/d \
+ && /tmp/a && /tmp/b && /tmp/c && /tmp/d && rm /tmp/t.cpp /tmp/a /tmp/b /tmp/c /tmp/d
+
+WORKDIR /work

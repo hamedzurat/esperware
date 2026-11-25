@@ -61,12 +61,12 @@ class HeadlessServerE2ETest {
     static void setupFixture() throws Exception {
         repoDir = Path.of("").toAbsolutePath().normalize();
         Path artifactsDir = repoDir.getParent().resolve("artifacts");
-        Process build = new ProcessBuilder("just", "build")
+        Process build = new ProcessBuilder("just", "host", "-p", "test", "gcc-O1-noinline")
                 .directory(artifactsDir.toFile())
                 .inheritIO()
                 .start();
-        assertEquals(0, build.waitFor(), "just build in artifacts/ failed");
-        fixturePath = artifactsDir.resolve("build/readability-fixture.stripped.elf");
+        assertEquals(0, build.waitFor(), "just host in artifacts/ failed");
+        fixturePath = artifactsDir.resolve("build/host/test/gcc-O1-noinline.stripped.elf");
 
         String sysTmp = System.getProperty("java.io.tmpdir", "/tmp");
         boolean hasDot = false;
@@ -78,7 +78,7 @@ class HeadlessServerE2ETest {
         Files.createDirectories(tmpRoot.resolve("cache"));
         Files.createDirectories(tmpRoot.resolve("input"));
         Files.copy(fixturePath, tmpRoot.resolve("input/readability-fixture.elf"));
-        Files.copy(artifactsDir.resolve("build/readability-fixture.unstripped.elf"),
+        Files.copy(artifactsDir.resolve("build/host/test/gcc-O1-noinline.unstripped.elf"),
                 tmpRoot.resolve("input/other-fixture.elf"));
     }
 

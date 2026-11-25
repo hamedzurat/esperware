@@ -1,28 +1,22 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-default: build
+image := "esperware-dataset"
 
-build:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p build
-    for src in *.c; do
-      [ -e "$src" ] || continue
-      stem="${src%.c}"
-      gcc -O1 -fno-inline -fno-stack-protector -no-pie -g "$src" -o "build/${stem}.unstripped.elf"
-      cp "build/${stem}.unstripped.elf" "build/${stem}.stripped.elf"
-      strip --strip-all "build/${stem}.stripped.elf"
-      echo "built build/${stem}.unstripped.elf + build/${stem}.stripped.elf (-O1)"
-    done
+default: dataset
 
-one name:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p build
-    gcc -O1 -fno-inline -fno-stack-protector -no-pie -g "{{name}}.c" -o "build/{{name}}.unstripped.elf"
-    cp "build/{{name}}.unstripped.elf" "build/{{name}}.stripped.elf"
-    strip --strip-all "build/{{name}}.stripped.elf"
-    echo "built build/{{name}}.unstripped.elf + build/{{name}}.stripped.elf (-O1)"
+# Build codes/<name>/ per dataset.toml inside the pinned container (see Containerfile).
+# `--all` or `<profile>...` override dataset.toml; `-p <glob>` limits programs.
+dataset *args:
+    podman image exists {{image}} || just image
+    podman run --rm --network=none -v "$PWD":/work -w /work {{image}} python3 build_dataset.py {{args}}
+
+# Same build with this machine's compilers, into build/host/. Not reproducible elsewhere.
+host *args:
+    python3 build_dataset.py --out build/host {{args}}
+
+# (Re)build the container image
+image:
+    podman build -t {{image}} - < Containerfile
 
 clean:
     if [ -e build ]; then /usr/bin/trash-put -- build; fi
