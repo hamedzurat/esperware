@@ -39,12 +39,6 @@ _launch mode binary dir fixed_port="":
         workspace+=(--binary "/input/$bin_name")
     fi
 
-    if [ "$mode" = dump ]; then
-        {{engine}} run --rm "${mounts[@]}" {{image}} "${workspace[@]}" --no-cache --dump
-        echo "Dumped to $dir_abs/run/code (state: $dir_abs)" >&2
-        exit 0
-    fi
-
     command -v jq >/dev/null || { echo "jq is required to check server readiness" >&2; exit 2; }
     mkdir -p "$dir_abs/cache"
     launch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
@@ -132,8 +126,10 @@ _launch mode binary dir fixed_port="":
     echo "Timed out waiting for $ready_file; check: just logs $port" >&2
     exit 1
 
-# Export pseudocode and metadata into <dir>/run/code/v<N>
-dump binary dir="": (_launch "dump" binary dir)
+# Export initial snapshots for a dataset program or one binary into .tmp/
+[positional-arguments]
+dump target:
+    @python3 "{{justfile_directory()}}/artifacts/dump.py" "$1" "{{engine}}" "{{image}}"
 
 # Stop a running container and wait for its name to become reusable
 stop port="8765":

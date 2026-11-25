@@ -50,10 +50,11 @@ just logs <port>               # View container logs
 just stop <port>               # Graceful shutdown
 just resume /tmp/my-run <port> # Reopen existing project and version history
 just wui [port] [ui_port]      # Serve the WebUI and print its URL for <port>, default UI port 4173
-just dump ./artifacts/build/dataset/test/gcc-O1-noinline.unstripped.elf /tmp/my-dump  # Export the current version to <dir>/run/code/v<N>
+just dump test                 # Export every built binary for the test program
+just dump ./artifacts/build/dataset/test/gcc-O1-noinline.unstripped.elf  # Export one binary
 ```
 
-A new workspace exports `v0`. An existing workspace exports its current version. Exporting the same version again reuses its published snapshot and checks that all listed files still exist. If the snapshot is incomplete, move its version directory out of `code/` before retrying.
+`just dump` writes each initial snapshot to `.tmp/<program>/<binary>/`, including stripped and unstripped binaries when a program name is given. A unique binary filename also works. Existing output is not overwritten; move it elsewhere before dumping that binary again.
 
 To export from a running server, send `POST /api/v1/export`. The server writes to `<work-dir>/code/v<current_version>/`. If tokens are configured, use the write token.
 

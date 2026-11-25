@@ -428,8 +428,8 @@ final class ProgramWorkspace implements AutoCloseable {
         }
 
         for (Variable dbVar : fn.getAllVariables()) {
-            long id = dbVar.getSymbol().getID();
-            if (seenSymbolIds.contains(id) || seenNames.contains(dbVar.getName())) continue;
+            var sym = dbVar.getSymbol();
+            if ((sym != null && seenSymbolIds.contains(sym.getID())) || seenNames.contains(dbVar.getName())) continue;
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("name", dbVar.getName());
             row.put("data_type", dbVar.getDataType().getDisplayName());
