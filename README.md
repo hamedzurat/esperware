@@ -54,7 +54,7 @@ just dump test                 # Export every built binary for the test program
 just dump ./artifacts/build/dataset/test/gcc-O1-noinline.unstripped.elf  # Export one binary
 ```
 
-`just dump` writes each initial snapshot to `.tmp/<program>/<binary>/`, including stripped and unstripped binaries when a program name is given. A unique binary filename also works. Existing output is not overwritten; move it elsewhere before dumping that binary again.
+`just dump` writes each initial snapshot to `.tmp/<program>/<profile>/<stripped|unstripped>/`, with combined container output in the matching `.txt` file. It includes both variants when a program name is given, runs up to 16 binaries in parallel, and prints progress as jobs finish. A unique binary filename also works. Existing output or log files are not overwritten; move them elsewhere before dumping that binary again.
 
 To export from a running server, send `POST /api/v1/export`. The server writes to `<work-dir>/code/v<current_version>/`. If tokens are configured, use the write token.
 
