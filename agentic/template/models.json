@@ -1,0 +1,29 @@
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "esperware": {
+      "name": "Esperware LLM",
+      "baseUrl": "${ESPERWARE_LLM_BASE_URL}",
+      "api": "openai-completions",
+      "apiKey": "${ESPERWARE_LLM_API_KEY}",
+      "models": [
+        {
+          "id": "${ESPERWARE_MODEL}",
+          "name": "${ESPERWARE_MODEL}",
+          "reasoning": true,
+          "thinkingLevelMap": { "minimal": null, "high": null, "xhigh": "xhigh" },
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+              "enable_thinking": { "$var": "thinking.enabled" },
+              "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true },
+              "preserve_thinking": true
+            }
+          },
+          "contextWindow": ${ESPERWARE_CONTEXT_WINDOW},
+          "maxTokens": ${ESPERWARE_MAX_TOKENS}
+        }
+      ]
+    }
+  }
+}

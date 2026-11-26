@@ -1,0 +1,9 @@
+{
+  "defaultProvider": "esperware",
+  "defaultModel": "${ESPERWARE_MODEL}",
+  "defaultThinkingLevel": "xhigh",
+  "defaultTools": [],
+  "defaultProjectTrust": "never",
+  "quietStartup": true,
+  "enableInstallTelemetry": false
+}

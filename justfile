@@ -118,6 +118,8 @@ _launch mode binary dir fixed_port="":
                 '.status == "ready" and .launch_id == $launch_id and .api_url == $api_url' \
                 >/dev/null 2>&1 <<<"$ready"; then
             echo "Started on port $port (state: $dir_abs)" >&2
+            "{{justfile_directory()}}/agentic/scaffold.sh" "$ready" "$dir_abs" > /dev/null \
+                || echo "warning: Pi workspace scaffold failed (server is running)" >&2
             printf '%s\n' "$ready"
             exit 0
         fi

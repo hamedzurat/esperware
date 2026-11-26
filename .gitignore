@@ -4,3 +4,7 @@
 .audit
 artifacts/build/
 .tmp/
+
+# Pi workspaces and local Pi config
+.runs/
+agentic/.env

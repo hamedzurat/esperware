@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Launch Pi for this run. Extra args go to Pi:
+#   ./pi                          interactive
+#   ./pi -p "task text"           one shot, final text on stdout
+#   ./pi --mode json "task text"  JSONL events on stdout
+# Edit agent/SYSTEM.md freely. models.json, mcp.json and settings.json are re-rendered
+# from template/ and agentic/.env on every start, so change those there.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+run_json="$here/run.json"
+pi_bin="$(jq -r .pi_bin "$run_json")"
+env_file="$(jq -r .env_file "$run_json")"
+
+if [ ! -f "$env_file" ]; then
+    echo "Missing $env_file (copy agentic/.env.example)" >&2
+    exit 2
+fi
+set -a
+# shellcheck disable=SC1090
+. "$env_file"
+set +a
+
+access="${ESPERWARE_MCP_ACCESS:-rw}"
+case "$access" in rw | ro) ;; *) echo "ESPERWARE_MCP_ACCESS must be rw or ro" >&2; exit 2 ;; esac
+ESPERWARE_MCP_URL="$(jq -r --arg k "mcp_${access}_url" '.[$k]' "$run_json")"
+export ESPERWARE_MCP_URL
+: "${ESPERWARE_LLM_BASE_URL:?set in $env_file}" "${ESPERWARE_MODEL:?set in $env_file}"
+export ESPERWARE_LLM_API_KEY="${ESPERWARE_LLM_API_KEY:-none}"
+export ESPERWARE_CONTEXT_WINDOW="${ESPERWARE_CONTEXT_WINDOW:-131072}"
+export ESPERWARE_MAX_TOKENS="${ESPERWARE_MAX_TOKENS:-16384}"
+
+vars='${ESPERWARE_LLM_BASE_URL} ${ESPERWARE_LLM_API_KEY} ${ESPERWARE_MODEL} ${ESPERWARE_CONTEXT_WINDOW} ${ESPERWARE_MAX_TOKENS} ${ESPERWARE_MCP_URL}'
+for f in models.json mcp.json settings.json; do
+    envsubst "$vars" < "$here/template/$f" > "$here/agent/$f"
+done
+
+export PI_CODING_AGENT_DIR="$here/agent"
+export PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0
+
+mkdir -p "$here/work" "$here/sessions"
+cd "$here/work"
+exec "$pi_bin" \
+    --no-context-files --no-skills --no-prompt-templates --no-approve \
+    --session-dir "$here/sessions" \
+    --provider esperware --model "$ESPERWARE_MODEL" \
+    "$@"

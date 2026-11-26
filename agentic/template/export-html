@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Dump every Pi session of this run to html/<session>.html:
+#   ./export-html          dark theme
+#   ./export-html light    light theme
+set -euo pipefail
+shopt -s nullglob
+
+theme="${1:-dark}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+pi_bin="$(jq -r .pi_bin "$here/run.json")"
+export PI_CODING_AGENT_DIR="$here/agent" PI_OFFLINE=1
+
+# `pi --export` takes no theme, so call Pi's exporter module directly.
+exporter="$(dirname "$(readlink -f "$pi_bin")")/../core/export-html/index.js"
+[ -f "$exporter" ] || { echo "Pi exporter not found: $exporter" >&2; exit 1; }
+
+sessions=("$here"/sessions/*.jsonl)
+[ "${#sessions[@]}" -gt 0 ] || { echo "No sessions in $here/sessions" >&2; exit 1; }
+
+mkdir -p "$here/html"
+for session in "${sessions[@]}"; do
+    node --input-type=module -e '
+        const [exporter, session, outputPath, themeName] = process.argv.slice(1);
+        const { exportFromFile } = await import(exporter);
+        console.log("Exported to: " + await exportFromFile(session, { outputPath, themeName }));
+    ' "$exporter" "$session" "$here/html/$(basename "$session" .jsonl).html" "$theme"
+done

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "esperware": {
+      "url": "${ESPERWARE_MCP_URL}",
+      "exposure": "direct",
+      "description": "Headless Ghidra server for the target binary: inspect functions, types and memory, and apply versioned edits."
+    }
+  }
+}
