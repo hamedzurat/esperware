@@ -1,6 +1,7 @@
 package org.esperware.ghidramcp;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import io.modelcontextprotocol.json.McpJsonDefaults;
 import io.modelcontextprotocol.server.McpServer;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
@@ -80,7 +81,8 @@ final class McpEndpoints implements AutoCloseable {
     }
 
     static List<ToolDef> buildToolDefs(ApiError.AccessMode mode, InspectService inspect, EditService edit) {
-        Gson gson = new Gson();
+        // HTML escaping would show agents \u003e for > and \u0027 for quotes, in errors and in pseudocode.
+        Gson gson = new GsonBuilder().disableHtmlEscaping().create();
         McpSchema.ToolAnnotations readAnn = McpSchema.ToolAnnotations.builder()
                 .readOnlyHint(true)
                 .destructiveHint(false)
@@ -179,7 +181,10 @@ final class McpEndpoints implements AutoCloseable {
 
         if (mode == ApiError.AccessMode.READ_WRITE) {
             defs.add(def("apply_edits",
-                    "Apply 1..50 atomic edits in one transaction, record a new version, redecompile touched functions once, and return unified diffs.",
+                    "Apply 1..50 atomic edits in one transaction, record a new version, redecompile touched functions once, and return unified diffs. "
+                            + "var_name is the name decompile showed before this batch, or a name this batch assigned. "
+                            + "One failed edit rolls back all of them; the error gives its 0-based edit_index. "
+                            + "Function-pointer types need a typedef from define_type first.",
                     schema(List.of("expected_version", "edits"), Map.of(
                             "expected_version", intProp("Optimistic lock version expected before these edits (from program_info or prior edit)."),
                             "reason", strProp("Short human-readable explanation recorded in version history."),
@@ -255,14 +260,16 @@ final class McpEndpoints implements AutoCloseable {
                     } catch (ApiError err) {
                         Map<String, Object> detail = new LinkedHashMap<>();
                         detail.put("code", err.code);
-                        detail.put("message", err.getMessage());
+                        detail.put("message", err.agentMessage());
                         if (err.currentVersion != null) detail.put("current_version", err.currentVersion);
+                        detail.putAll(err.details);
                         return McpSchema.CallToolResult.builder()
                                 .addTextContent(gson.toJson(Map.of("ok", false, "error", detail)))
                                 .isError(true)
                                 .build();
                     } catch (Exception ex) {
-                        String msg = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+                        String msg = "Unexpected server error in " + name + ": " + ex.getClass().getSimpleName()
+                                + (ex.getMessage() == null ? "" : ": " + ex.getMessage());
                         return McpSchema.CallToolResult.builder()
                                 .addTextContent(gson.toJson(Map.of("ok", false, "error",
                                         Map.of("code", "OPERATION_FAILED", "message", msg))))

@@ -1,0 +1,77 @@
+# The Ghidra MCP server. Build from the repository root (`just image`).
+# The build runs the unit and end-to-end tests, and fails if any of them fail.
+#
+# To update Ghidra, change the three ARG values below.
+FROM docker.io/library/eclipse-temurin:25-jdk AS build
+
+ARG GHIDRA_VERSION=12.2
+ARG GHIDRA_BUILD=20261016
+ARG GHIDRA_SHA256=2c2cd776db3c1f6a097ba418922378ac3649cadd5e844a6f5f088ae628a7be67
+
+WORKDIR /build/ghidraMCP
+RUN apt-get update && apt-get install -y --no-install-recommends curl unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_BUILD}.zip" -o ghidra.zip \
+    && echo "${GHIDRA_SHA256}  ghidra.zip" | sha256sum -c - \
+    && unzip -q ghidra.zip -d /opt \
+    && mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra
+
+# A headless server needs neither the manuals nor the optional extension archives.
+RUN rm -rf /opt/ghidra/docs /opt/ghidra/Extensions \
+    && mkdir -p "/root/.config/ghidra/ghidra_${GHIDRA_VERSION}_PUBLIC" \
+    && printf 'USER_AGREEMENT=ACCEPT\n' > "/root/.config/ghidra/ghidra_${GHIDRA_VERSION}_PUBLIC/preferences"
+
+COPY ghidraMCP/build.gradle ghidraMCP/settings.gradle ghidraMCP/gradlew ./
+COPY ghidraMCP/gradle ./gradle
+# Main sources only, so editing a test does not recompile the server in this stage.
+COPY ghidraMCP/src/main ./src/main
+# The cache mount keeps Gradle and the dependencies between builds.
+RUN --mount=type=cache,target=/root/.gradle \
+    GHIDRA_INSTALL_DIR=/opt/ghidra ./gradlew --no-daemon stageServer
+
+# Tests run on the dataset's pinned toolchain: they expect the binaries that its GCC produces.
+# Keep these three instructions identical to artifacts/Containerfile, which also shares the layers.
+FROM docker.io/archlinux/archlinux:base@sha256:c3581e5f269b95678eb55477592a7c030486bfdcb9b00ea75469c428d99cdf61 AS test
+
+ARG DATE=2026/11/24
+
+RUN echo "Server = https://archive.archlinux.org/repos/${DATE}/\$repo/os/\$arch" > /etc/pacman.d/mirrorlist \
+ && pacman -Syyuu --noconfirm --disable-download-timeout \
+ && pacman -S --noconfirm --needed --disable-download-timeout \
+      gcc glibc binutils \
+      clang llvm-libs libc++ libc++abi \
+      python \
+ && pacman -Scc --noconfirm
+
+RUN pacman -Sy --noconfirm --needed --disable-download-timeout just && pacman -Scc --noconfirm
+
+COPY --from=build /opt/java/openjdk /opt/java/openjdk
+COPY --from=build /opt/ghidra /opt/ghidra
+COPY --from=build /root/.config/ghidra /root/.config/ghidra
+COPY --from=build /build/ghidraMCP /build/ghidraMCP
+# The end-to-end tests compile their fixture binaries with `just host` in artifacts/.
+COPY artifacts /build/artifacts
+COPY ghidraMCP/bin /build/ghidraMCP/bin
+COPY ghidraMCP/src/test /build/ghidraMCP/src/test
+WORKDIR /build/ghidraMCP
+RUN --mount=type=cache,target=/root/.gradle \
+    JAVA_HOME=/opt/java/openjdk PATH="/opt/java/openjdk/bin:$PATH" GHIDRA_INSTALL_DIR=/opt/ghidra \
+    ./gradlew --no-daemon --console=plain test e2eTest -De2e.mode=local
+
+FROM docker.io/library/eclipse-temurin:25-jdk
+# Least often changed first, so a source change only replaces the small layers.
+COPY --from=build /opt/ghidra /opt/ghidra
+COPY --from=build /root/.config/ghidra /root/.config/ghidra
+COPY --chmod=755 ghidraMCP/bin/ghidra-mcp /opt/ghidra-mcp/bin/ghidra-mcp
+COPY ghidraMCP/bin/log4j-headless.xml /opt/ghidra-mcp/bin/log4j-headless.xml
+# Taken from the test stage, so no image exists unless the tests passed.
+COPY --from=test /build/ghidraMCP/build/server /opt/ghidra-mcp
+
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra \
+    GHIDRA_MCP_HOME=/opt/ghidra-mcp \
+    GHIDRA_MCP_HOST=0.0.0.0 \
+    GHIDRA_MCP_PORT=8765
+
+WORKDIR /data
+EXPOSE 8765
+ENTRYPOINT ["/opt/ghidra-mcp/bin/ghidra-mcp"]

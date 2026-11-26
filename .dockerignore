@@ -2,6 +2,8 @@
 .agents
 .claude
 artifacts/build
+.runs
+.tmp
 wui
 .audit
 ghidraMCP/.local

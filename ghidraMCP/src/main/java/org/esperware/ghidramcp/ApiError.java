@@ -5,6 +5,7 @@ import com.google.gson.JsonParseException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -12,11 +13,56 @@ import java.util.Map;
 final class ApiError extends RuntimeException {
     final String code;
     final Long currentVersion;
+    final Map<String, Object> details;
 
     ApiError(String code, String message, Long currentVersion) {
+        this(code, message, currentVersion, Map.of());
+    }
+
+    ApiError(String code, String message, Long currentVersion, Map<String, Object> details) {
         super(message);
         this.code = code;
         this.currentVersion = currentVersion;
+        this.details = details;
+    }
+
+    ApiError withVersion(Long version) {
+        return new ApiError(code, getMessage(), version, details);
+    }
+
+    /** The text an agent reads: what went wrong, then what to do about it. */
+    String agentMessage() {
+        String next = switch (code) {
+            case "STALE_VERSION" ->
+                    "Read the current state again, then resend with expected_version set to current_version";
+            case "FUNCTION_NOT_FOUND" ->
+                    "Use list_functions for names and entry addresses; code outside any function needs create_function";
+            case "GLOBAL_NOT_FOUND" -> "Pass the global's address, or find it with list_symbols kind=globals";
+            case "INVALID_CURSOR" ->
+                    "Pass next_cursor from the previous response unchanged with the same arguments, or omit cursor";
+            case "INVALID_TYPE" -> "Find existing types with get_type, or declare a new one with define_type";
+            case "INVALID_TYPE_DECLARATION" ->
+                    "Send C struct, union, enum or typedef declarations; every type they use must already exist";
+            case "INVALID_SIGNATURE" ->
+                    "Send a full C prototype such as 'int name(int a, char *b)' using types that exist";
+            case "TYPE_EXISTS" -> "Use the existing type, or declare yours under another name";
+            case "REVERT_UNAVAILABLE" -> "Choose a later to_version, or correct the program with new edits";
+            case "MEMORY_READ_FAILED" -> "Use get_xrefs to see how the address is used";
+            case "RECOVERY_REQUIRED" -> "No tool call will work until then; stop and report this";
+            default -> null;
+        };
+        if (next == null) return getMessage();
+        String message = getMessage().stripTrailing();
+        return message + (message.endsWith(".") ? " " : ". ") + next + ".";
+    }
+
+    /** Says which edit of a batch failed, so the caller can fix that one and resend. */
+    ApiError atEdit(int index, Object op) {
+        Map<String, Object> extended = new LinkedHashMap<>(details);
+        extended.put("edit_index", index);
+        if (op != null) extended.put("op", String.valueOf(op));
+        String edit = "edits[" + index + "]" + (op == null ? "" : " " + op);
+        return new ApiError(code, edit + " failed, no edits applied: " + getMessage(), currentVersion, extended);
     }
 
     enum AccessMode {

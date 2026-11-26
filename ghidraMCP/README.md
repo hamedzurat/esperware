@@ -98,6 +98,8 @@ Every edit checks `expected_version` before making changes. The server writes th
 
 Older projects have no saved version number. On first open, the server pairs the saved project with the current ledger version and starts tracking that pair. An inconsistency from a crash before the upgrade cannot be detected by the new marker.
 
+In `apply_edits`, `var_name` means the name `decompile` showed before the batch, or a name the batch assigned; the server follows the variable when earlier edits renumber `uVar*` names. If it was split, merged or removed, the batch fails with `VARIABLE_CHANGED`. A failed batch changes nothing and reports `edit_index` and `op`; `VARIABLE_NOT_FOUND` also lists `available_variables`. Signatures and types do not accept inline function pointers: declare a typedef with `define_type` first. Tool errors are JSON text, `{"ok":false,"error":{"code","message"}}`, where `message` says what failed and what to do next; argument schema errors come from the MCP library as plain text.
+
 `revert` checks the entire requested range before applying inverse operations and records a new version on success. `define_type` rejects overwrites. A revert that crosses a legacy type definition or a version with an operation the server cannot reverse returns `REVERT_UNAVAILABLE`. `save_checkpoint` labels the current saved version.
 
 Range diffs compare pseudocode by function address. When a name filter matches a function, the diff includes its earlier edits in the range under other names. Address filters accept both zero-padded hex addresses and short `0x`-prefixed hex addresses.

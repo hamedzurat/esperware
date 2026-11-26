@@ -306,6 +306,10 @@ final class InspectService {
             Function fn = ws.resolveFunction(target);
             ProgramWorkspace.CachedDecompile res = ws.decompileCached(fn, DECOMPILE_TIMEOUT_SEC);
             String fullCode = res.code() == null ? "" : res.code();
+            if (offset > 0 && offset >= fullCode.length()) {
+                throw new ApiError("INVALID_ARGUMENT", "offset " + offset + " is past the end of the pseudocode ("
+                        + fullCode.length() + " characters). Use next_offset from the previous call, or 0", null);
+            }
             int start = Math.min(offset, fullCode.length());
             int end = Math.min(start + PSEUDOCODE_SLICE_CHARS, fullCode.length());
             boolean truncated = end < fullCode.length();
@@ -354,6 +358,10 @@ final class InspectService {
                 scopeLabel = fn.getName() + " @ " + fn.getEntryPoint();
             } else {
                 Address startAddr = rawAddr != null ? rawAddr : ws.resolveFunction(target).getEntryPoint();
+                if (p.getListing().getInstructionContaining(startAddr) == null) {
+                    throw new ApiError("NOT_FOUND", "No instruction at " + target + ": the address is unmapped, "
+                            + "holds data or is not disassembled. Use read_memory for its bytes", null);
+                }
                 it = p.getListing().getInstructions(startAddr, true);
                 scopeLabel = startAddr.toString();
             }
@@ -502,9 +510,11 @@ final class InspectService {
 
         return ws.withReadLock(() -> {
             Address addr = ws.parseAddress(addrStr);
-            if (addr == null) throw new ApiError("INVALID_ARGUMENT", "Invalid address: " + addrStr, null);
+            if (addr == null) throw new ApiError("INVALID_ARGUMENT",
+                    "Invalid address: " + addrStr + ". Use a hex address such as 0x401000", null);
             MemoryBlock blk = ws.program().getMemory().getBlock(addr);
-            if (blk == null) throw new ApiError("NOT_FOUND", "Unmapped memory address: " + addrStr, null);
+            if (blk == null) throw new ApiError("NOT_FOUND",
+                    "Unmapped memory address: " + addrStr + ". program_info lists the mapped segments", null);
             if (!blk.isInitialized()) {
                 throw new ApiError("MEMORY_READ_FAILED",
                         "Memory at " + addrStr + " is uninitialized (" + blk.getName() + ")", null);

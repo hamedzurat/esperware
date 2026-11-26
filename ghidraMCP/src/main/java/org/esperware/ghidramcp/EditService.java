@@ -4,10 +4,12 @@ import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.cmd.function.DeleteFunctionCmd;
 import ghidra.app.util.cparser.C.CParser;
+import ghidra.app.util.cparser.C.ParseException;
 import ghidra.app.util.parser.FunctionSignatureParser;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressOverflowException;
 import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.data.BuiltInDataType;
 import ghidra.program.model.data.CategoryPath;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeConflictHandler;
@@ -26,9 +28,9 @@ import ghidra.program.model.listing.ParameterImpl;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.listing.Variable;
 import ghidra.program.model.mem.MemoryBlock;
-import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
 import ghidra.program.model.pcode.HighSymbol;
+import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.SourceType;
@@ -42,12 +44,12 @@ import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -58,6 +60,9 @@ final class EditService {
     private static final int MAX_BATCH_OPS = 50;
     private static final int MAX_AUTO_GLOBAL_REFS = 10;
     private static final Pattern SIG_NAME_PATTERN = Pattern.compile("^(.*?)\\b([A-Za-z_][A-Za-z0-9_]*)$");
+    private static final List<String> EDIT_OPS = List.of("create_function", "rename_function", "rename_var",
+            "set_var_type", "rename_global", "set_global_type", "set_signature", "set_comment");
+    private static final Pattern FUNCTION_POINTER_PATTERN = Pattern.compile("\\(\\s*\\*");
 
     private static final class AddTypesOnly extends DataTypeConflictHandler {
         private final Set<String> existingPaths;
@@ -87,6 +92,8 @@ final class EditService {
 
     private final ProgramWorkspace ws;
     private final VersionStore store;
+    /** Index of the edit being resolved or applied, -1 otherwise. Guarded by the workspace write lock. */
+    private int editIndex = -1;
 
     EditService(ProgramWorkspace ws, VersionStore store) {
         this.ws = ws;
@@ -98,10 +105,11 @@ final class EditService {
         long expected = ApiError.reqLong(args, "expected_version", store.currentVersion());
         String reason = ApiError.optStr(args, "reason");
         List<Map<String, Object>> edits = ApiError.reqMapList(args, "edits", MAX_BATCH_OPS);
-        for (Map<String, Object> op : edits) {
-            String kind = ApiError.reqStr(op, "op");
-            if (List.of("remove_type", "delete_function", "clear_data").contains(kind)) {
-                throw new ApiError("INVALID_ARGUMENT", "Unsupported edit op: " + kind, null);
+        for (int i = 0; i < edits.size(); i++) {
+            Object kind = edits.get(i).get("op");
+            if (!(kind instanceof String name) || !EDIT_OPS.contains(name)) {
+                throw new ApiError("INVALID_ARGUMENT", (kind == null ? "Missing op" : "Unsupported edit op: " + kind)
+                        + ". Each edit needs an op, one of " + String.join(", ", EDIT_OPS), null).atEdit(i, kind);
             }
         }
 
@@ -134,7 +142,13 @@ final class EditService {
             List<DataType> parsedTypes = new ArrayList<>();
             try (StandAloneDataTypeManager tempDtm = new StandAloneDataTypeManager("mcp_parse")) {
                 CParser parser = new CParser(tempDtm, true, new DataTypeManager[] {targetDtm});
-                parser.parse(new ByteArrayInputStream(cDecl.getBytes(StandardCharsets.UTF_8)));
+                try {
+                    parser.parse(new ByteArrayInputStream(cDecl.getBytes(StandardCharsets.UTF_8)));
+                } catch (ParseException ex) {
+                    // The parser appends every token it would have accepted; only the position helps.
+                    String position = String.valueOf(ex.getMessage()).split("Was expecting", 2)[0].strip();
+                    throw new ApiError("INVALID_TYPE_DECLARATION", "C parse failed: " + position, current);
+                }
                 if (!parser.didParseSucceed()) {
                     throw new ApiError("INVALID_TYPE_DECLARATION",
                             "C parse failed: " + parser.getParseMessages(), current);
@@ -147,14 +161,21 @@ final class EditService {
                         if (dt != null && seenNames.add(dt.getPathName())) parsedTypes.add(dt);
                     }
                 }
-                if (parsedTypes.isEmpty() && parser.getLastDataType() != null) {
+                if (parsedTypes.isEmpty() && parser.getLastDataType() != null
+                        && !(parser.getLastDataType() instanceof BuiltInDataType)) {
                     parsedTypes.add(parser.getLastDataType());
                 }
                 if (parsedTypes.isEmpty()) {
                     throw new ApiError("INVALID_TYPE_DECLARATION", "No data type found in c_declaration", current);
                 }
 
-                CategoryPath cat = new CategoryPath(categoryPath);
+                CategoryPath cat;
+                try {
+                    cat = new CategoryPath(categoryPath);
+                } catch (IllegalArgumentException ex) {
+                    throw new ApiError("INVALID_ARGUMENT", "Invalid category '" + categoryPath + "': "
+                            + ex.getMessage() + ". Use a path such as /mcp", current);
+                }
                 try (var tx = tempDtm.openTransaction("Set declaration category")) {
                     for (DataType dt : parsedTypes) {
                         if (dt.getDataTypeManager() == tempDtm) dt.setCategoryPath(cat);
@@ -253,13 +274,18 @@ final class EditService {
             String reason,
             List<Map<String, Object>> ops) throws Exception {
         long current = store.currentVersion();
+        editIndex = -1;
         try {
             return ws.runEdit(() -> applyAndRecordBatch(operation, actor, reason, ops, current));
-        } catch (ApiError err) {
-            throw new ApiError(err.code, err.getMessage(), current);
         } catch (Exception ex) {
-            throw new ApiError("EDIT_FAILED",
-                    ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(), current);
+            ApiError err = ex instanceof ApiError api
+                    ? api.withVersion(current)
+                    : new ApiError("EDIT_FAILED",
+                            ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(), current);
+            if ("apply_edits".equals(operation) && editIndex >= 0) {
+                throw err.atEdit(editIndex, ops.get(editIndex).get("op"));
+            }
+            throw err;
         }
     }
 
@@ -276,16 +302,18 @@ final class EditService {
             beforeCode.put(e.getKey(), "complete".equals(d.status()) ? d.code() : null);
         }
 
-        Map<String, HighFunction> liveHfCache = new HashMap<>();
-        Map<String, Map<String, String>> varRenameAliases = new HashMap<>();
+        // Revert ops name variables as they are at that step, so only apply_edits needs the snapshot.
+        BatchVars vars = new BatchVars();
+        vars.checkNames = "apply_edits".equals(operation);
+        if (vars.checkNames) snapshotVariables(ops, pre, vars);
         List<List<Map<String, Object>>> perOpInverses = new ArrayList<>();
-        for (Map<String, Object> op : ops) {
-            List<Map<String, Object>> inv = applyOp(op, liveHfCache, varRenameAliases);
+        for (editIndex = 0; editIndex < ops.size(); editIndex++) {
+            List<Map<String, Object>> inv = applyOp(ops.get(editIndex), vars);
             if (inv != null && !inv.isEmpty()) perOpInverses.add(inv);
-            if ("revert".equals(operation)) varRenameAliases.clear();
+            if ("revert".equals(operation)) vars.renamed.clear();
+            ws.invalidateCache();
         }
-
-        ws.invalidateCache();
+        editIndex = -1;
 
         for (String createdAddrStr : pre.pendingCreatedAddrs) {
             Address createdAddr = ws.parseAddress(createdAddrStr);
@@ -363,7 +391,8 @@ final class EditService {
     private PreResolution preResolveTouchedFunctions(List<Map<String, Object>> ops) {
         Program p = ws.program();
         PreResolution pre = new PreResolution();
-        for (Map<String, Object> op : ops) {
+        for (editIndex = 0; editIndex < ops.size(); editIndex++) {
+            Map<String, Object> op = ops.get(editIndex);
             String kind = ApiError.reqStr(op, "op");
             switch (kind) {
                 case "create_function" -> {
@@ -400,11 +429,11 @@ final class EditService {
                         }
                     }
                 }
-                case "rename_var", "set_var_type" -> {
+                case "rename_var", "set_var_type", "reset_var" -> {
                     Function fn = resolvePreFunction(ApiError.reqStr(op, "function"), pre);
                     if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
                 }
-                case "delete_function" -> {
+                case "delete_function", "reset_signature" -> {
                     Function fn = resolvePreFunction(ApiError.reqStr(op, "target"), pre);
                     if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
                 }
@@ -420,7 +449,7 @@ final class EditService {
                         if (fn != null) pre.touchedFunctions.putIfAbsent(fn.getEntryPoint().toString(), fn);
                     }
                 }
-                case "rename_global", "set_global_type" -> {
+                case "rename_global", "set_global_type", "reset_global_name" -> {
                     String target = ApiError.reqStr(op, "target");
                     Address gAddr = resolveGlobalAddrForPre(target, pre);
                     if ("rename_global".equals(kind) && gAddr != null) {
@@ -446,6 +475,7 @@ final class EditService {
                 default -> throw new ApiError("INVALID_ARGUMENT", "Unsupported edit op: " + kind, null);
             }
         }
+        editIndex = -1;
         return pre;
     }
 
@@ -536,10 +566,7 @@ final class EditService {
         }
     }
 
-    private List<Map<String, Object>> applyOp(
-            Map<String, Object> op,
-            Map<String, HighFunction> liveHfCache,
-            Map<String, Map<String, String>> varRenameAliases) throws Exception {
+    private List<Map<String, Object>> applyOp(Map<String, Object> op, BatchVars vars) throws Exception {
         String kind = ApiError.reqStr(op, "op");
         Program p = ws.program();
 
@@ -556,38 +583,46 @@ final class EditService {
                 String fnAddr = fn.getEntryPoint().toString();
                 String requestedName = ApiError.reqStr(op, "var_name");
                 String newName = ApiError.reqStr(op, "new_name");
-                String effectiveName = varRenameAliases.getOrDefault(fnAddr, Map.of())
-                        .getOrDefault(requestedName, requestedName);
-                VarHandle vh = resolveVar(fn, effectiveName, liveHfCache);
+                VarHandle vh = resolveVar(fn, requestedName, vars);
                 String oldName = vh.name();
+                boolean unstored = vh.unstored();
+                if (vars.checkNames && !newName.equals(oldName) && variableNames(fn).contains(newName)) {
+                    // Ghidra would accept this and silently rename the other variable to a temporary name.
+                    throw new ApiError("NAME_TAKEN", fn.getName() + " already has a variable named '" + newName
+                            + "'. Choose another name, or rename that variable first", null);
+                }
                 vh.rename(newName);
-                var aliases = varRenameAliases.computeIfAbsent(fnAddr, k -> new HashMap<>());
+                var aliases = vars.renamed.computeIfAbsent(fnAddr, k -> new HashMap<>());
                 aliases.replaceAll((alias, name) -> name.equals(oldName) ? newName : name);
-                aliases.put(oldName, newName);
+                aliases.put(requestedName, newName);
                 aliases.put(newName, newName);
-                liveHfCache.remove(fnAddr);
-                yield List.of(Map.of("op", "rename_var", "function", fnAddr, "var_name", newName, "new_name", oldName));
+                yield List.of(unstored
+                        ? resetVarOp(fnAddr, newName, oldName)
+                        : Map.of("op", "rename_var", "function", fnAddr, "var_name", newName, "new_name", oldName));
             }
             case "set_var_type" -> {
                 Function fn = ws.resolveFunction(ApiError.reqStr(op, "function"));
                 String fnAddr = fn.getEntryPoint().toString();
                 String requestedName = ApiError.reqStr(op, "var_name");
-                String effectiveName = varRenameAliases.getOrDefault(fnAddr, Map.of())
-                        .getOrDefault(requestedName, requestedName);
                 DataType dt = parseType(ApiError.reqStr(op, "type"));
-                VarHandle vh = resolveVar(fn, effectiveName, liveHfCache);
+                VarHandle vh = resolveVar(fn, requestedName, vars);
                 String oldPath = vh.dataTypePath();
+                boolean unstored = vh.unstored();
                 vh.setType(dt);
-                liveHfCache.remove(fnAddr);
-                yield List.of(Map.of("op", "set_var_type", "function", fnAddr, "var_name", vh.name(), "type", oldPath));
+                yield List.of(unstored
+                        ? resetVarOp(fnAddr, vh.name(), vh.name())
+                        : Map.of("op", "set_var_type", "function", fnAddr, "var_name", vh.name(), "type", oldPath));
             }
+            case "reset_var" -> removeStoredVariable(op);
             case "rename_global" -> List.of(renameGlobalOp(op));
+            case "reset_global_name" -> List.of(resetGlobalNameOp(op));
             case "set_global_type" -> setGlobalTypeOp(op);
             case "clear_data" -> clearDataOp(op);
-            case "set_signature" -> List.of(setSignatureOp(op, liveHfCache));
+            case "set_signature" -> List.of(setSignatureOp(op, vars));
+            case "reset_signature" -> List.of(resetSignatureOp(op));
             case "create_function" -> createFunctionOp(op);
-            case "delete_function" -> deleteFunctionOp(op, liveHfCache);
-            case "set_comment" -> List.of(applyComment(op, liveHfCache, varRenameAliases));
+            case "delete_function" -> deleteFunctionOp(op);
+            case "set_comment" -> List.of(applyComment(op, vars));
             case "remove_type" -> {
                 String path = ApiError.reqStr(op, "path");
                 DataType dt = p.getDataTypeManager().getDataType(path);
@@ -600,18 +635,69 @@ final class EditService {
         };
     }
 
+    /** Inverse of the edit that first stored a decompiler local: forget it, so its automatic name returns. */
+    private static Map<String, Object> resetVarOp(String fnAddr, String name, String automaticName) {
+        return Map.of("op", "reset_var", "function", fnAddr, "var_name", name, "automatic_name", automaticName);
+    }
+
+    /** Applies reset_var and returns the ops that store the variable again. */
+    private List<Map<String, Object>> removeStoredVariable(Map<String, Object> op) throws Exception {
+        Function fn = ws.resolveFunction(ApiError.reqStr(op, "function"));
+        String name = ApiError.reqStr(op, "var_name");
+        String automaticName = ApiError.reqStr(op, "automatic_name");
+        Variable stored = null;
+        for (Variable v : fn.getAllVariables()) {
+            if (v.getName().equals(name)) stored = v;
+        }
+        if (stored == null) {
+            throw new ApiError("VARIABLE_NOT_FOUND", "Variable '" + name + "' not found in " + fn.getName(), null);
+        }
+        String type = stored.getDataType().getPathName();
+        String comment = stored.getComment();
+        fn.removeVariable(stored);
+
+        String fnAddr = fn.getEntryPoint().toString();
+        List<Map<String, Object>> redo = new ArrayList<>();
+        if (!automaticName.equals(name)) {
+            redo.add(Map.of("op", "rename_var", "function", fnAddr, "var_name", automaticName, "new_name", name));
+        }
+        redo.add(Map.of("op", "set_var_type", "function", fnAddr, "var_name", name, "type", type));
+        if (comment != null) {
+            redo.add(Map.of("op", "set_comment", "comment_type", "var", "target", fnAddr,
+                    "var_name", name, "text", comment));
+        }
+        return redo;
+    }
+
     private Map<String, Object> renameGlobalOp(Map<String, Object> op) throws Exception {
         GlobalHandle gh = resolveGlobal(ApiError.reqStr(op, "target"));
         String oldName = gh.symbol.getName();
+        // Writing an automatic name such as DAT_00404018 back would pin it, even after the data type changes.
+        boolean automatic = gh.symbol.isDynamic();
         String newName = ApiError.reqStr(op, "new_name");
         gh.symbol.setName(newName, SourceType.USER_DEFINED);
         Map<String, Object> inv = new LinkedHashMap<>();
-        inv.put("op", "rename_global");
+        inv.put("op", automatic ? "reset_global_name" : "rename_global");
         inv.put("target", gh.address.toString());
-        inv.put("new_name", oldName);
+        if (!automatic) inv.put("new_name", oldName);
         String fnHint = ApiError.optStr(op, "function");
         if (fnHint != null) inv.put("function", fnHint);
         return inv;
+    }
+
+    /** Removes a global's stored name and returns the op that stores it again. */
+    private Map<String, Object> resetGlobalNameOp(Map<String, Object> op) {
+        GlobalHandle gh = resolveGlobal(ApiError.reqStr(op, "target"));
+        Map<String, Object> redo = new LinkedHashMap<>();
+        redo.put("op", "rename_global");
+        redo.put("target", gh.address.toString());
+        redo.put("new_name", gh.symbol.getName());
+        String fnHint = ApiError.optStr(op, "function");
+        if (fnHint != null) redo.put("function", fnHint);
+        if (!gh.symbol.delete()) {
+            throw new ApiError("REVERT_UNAVAILABLE", "Cannot remove the name of global " + gh.address, null);
+        }
+        return redo;
     }
 
     private List<Map<String, Object>> setGlobalTypeOp(Map<String, Object> op) throws Exception {
@@ -741,16 +827,35 @@ final class EditService {
         return inv;
     }
 
-    private Map<String, Object> setSignatureOp(Map<String, Object> op, Map<String, HighFunction> liveHfCache) throws Exception {
+    private Map<String, Object> setSignatureOp(Map<String, Object> op, BatchVars vars) throws Exception {
         Program p = ws.program();
         Function fn = ws.resolveFunction(ApiError.reqStr(op, "target"));
         String oldSig = fn.getPrototypeString(false, true);
         String oldCc = fn.getCallingConventionName();
+        String oldName = fn.getName();
+        boolean defaultName = fn.getSymbol().getSource() == SourceType.DEFAULT;
+        // A signature nobody set cannot be restored from text: that would lock it, usually as (void).
+        boolean defaultSignature = fn.getSignatureSource() == SourceType.DEFAULT;
         String newSig = ApiError.reqStr(op, "signature");
         String explicitCc = ApiError.optStr(op, "calling_convention");
 
+        if (explicitCc != null) {
+            List<String> known = new ArrayList<>(p.getFunctionManager().getCallingConventionNames());
+            known.add(Function.DEFAULT_CALLING_CONVENTION_STRING);
+            known.add(Function.UNKNOWN_CALLING_CONVENTION_STRING);
+            if (!known.contains(explicitCc)) {
+                throw new ApiError("INVALID_ARGUMENT", "Unknown calling_convention '" + explicitCc
+                        + "'. Omit it, or use one of " + String.join(", ", known), null);
+            }
+        }
+
         FunctionSignatureParser parser = new FunctionSignatureParser(p.getDataTypeManager(), null);
-        FunctionDefinition def = parser.parse((FunctionSignature) fn.getSignature(), newSig);
+        FunctionDefinition def;
+        try {
+            def = parser.parse((FunctionSignature) fn.getSignature(), newSig);
+        } catch (ParseException ex) {
+            throw new ApiError("INVALID_SIGNATURE", ex.getMessage() + functionPointerHint(newSig), null);
+        }
         List<Variable> params = new ArrayList<>();
         for (ParameterDefinition pd : def.getArguments()) {
             params.add(new ParameterImpl(pd.getName(), pd.getDataType(), p, SourceType.USER_DEFINED));
@@ -776,12 +881,37 @@ final class EditService {
         if (def.getName() != null && !def.getName().isBlank() && !def.getName().equals(fn.getName())) {
             fn.setName(def.getName(), SourceType.USER_DEFINED);
         }
-        liveHfCache.remove(fn.getEntryPoint().toString());
-        return Map.of(
+        // From here on, these names mean the new parameters, whatever they meant before the batch.
+        String fnAddr = fn.getEntryPoint().toString();
+        for (ParameterDefinition pd : def.getArguments()) {
+            vars.declared.computeIfAbsent(fnAddr, k -> new HashSet<>()).add(pd.getName());
+            vars.renamed.getOrDefault(fnAddr, new HashMap<>()).remove(pd.getName());
+        }
+        Map<String, Object> inverse = new LinkedHashMap<>();
+        inverse.put("op", defaultSignature ? "reset_signature" : "set_signature");
+        inverse.put("target", fnAddr);
+        inverse.put("calling_convention", oldCc == null ? Function.UNKNOWN_CALLING_CONVENTION_STRING : oldCc);
+        if (!defaultSignature) inverse.put("signature", oldSig);
+        else if (!defaultName) inverse.put("name", oldName);
+        return inverse;
+    }
+
+    /** Returns a function to the state where the decompiler infers its signature. */
+    private Map<String, Object> resetSignatureOp(Map<String, Object> op) throws Exception {
+        Function fn = ws.resolveFunction(ApiError.reqStr(op, "target"));
+        Map<String, Object> redo = Map.of(
                 "op", "set_signature",
                 "target", fn.getEntryPoint().toString(),
-                "signature", oldSig,
-                "calling_convention", oldCc == null ? Function.UNKNOWN_CALLING_CONVENTION_STRING : oldCc);
+                "signature", fn.getPrototypeString(false, true),
+                "calling_convention", fn.getCallingConventionName());
+        fn.updateFunction(ApiError.reqStr(op, "calling_convention"), null, List.of(),
+                Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, true, SourceType.DEFAULT);
+        fn.setReturnType(DataType.DEFAULT, SourceType.DEFAULT);
+        fn.setVarArgs(false);
+        String name = ApiError.optStr(op, "name");
+        fn.setName(name, name == null ? SourceType.DEFAULT : SourceType.USER_DEFINED);
+        fn.setSignatureSource(SourceType.DEFAULT);
+        return redo;
     }
 
     private List<Map<String, Object>> createFunctionOp(Map<String, Object> op) {
@@ -804,6 +934,9 @@ final class EditService {
                     "Address " + addr + " is already inside function " + containing.getName() + " @ " + containing.getEntryPoint(), null);
         }
 
+        Symbol label = p.getSymbolTable().getPrimarySymbol(addr);
+        boolean unnamedBefore = label == null || label.isDynamic();
+
         if (p.getListing().getInstructionAt(addr) == null) {
             DisassembleCommand dis = new DisassembleCommand(addr, null, true);
             dis.enableCodeAnalysis(false);
@@ -821,10 +954,10 @@ final class EditService {
             String detail = cmd.getStatusMsg() != null ? ": " + cmd.getStatusMsg() : "";
             throw new ApiError("EDIT_FAILED", "Could not create function at " + addr + detail, null);
         }
-        return List.of(Map.of("op", "delete_function", "target", addr.toString()));
+        return List.of(Map.of("op", "delete_function", "target", addr.toString(), "drop_label", unnamedBefore));
     }
 
-    private List<Map<String, Object>> deleteFunctionOp(Map<String, Object> op, Map<String, HighFunction> liveHfCache) {
+    private List<Map<String, Object>> deleteFunctionOp(Map<String, Object> op) {
         Program p = ws.program();
         Function fn = ws.resolveFunction(ApiError.reqStr(op, "target"));
         Address entry = fn.getEntryPoint();
@@ -835,7 +968,12 @@ final class EditService {
             String detail = cmd.getStatusMsg() != null ? ": " + cmd.getStatusMsg() : "";
             throw new ApiError("EDIT_FAILED", "Could not delete function at " + entry + detail, null);
         }
-        liveHfCache.remove(entry.toString());
+        // Ghidra keeps the function's name as a label; undoing a creation must not leave it behind.
+        if (ApiError.optBool(op, "drop_label", false)) {
+            for (Symbol symbol : p.getSymbolTable().getSymbols(entry)) {
+                if (!symbol.isDynamic()) symbol.delete();
+            }
+        }
         Map<String, Object> inv = new LinkedHashMap<>();
         inv.put("op", "create_function");
         inv.put("target", entry.toString());
@@ -843,10 +981,7 @@ final class EditService {
         return List.of(inv);
     }
 
-    private Map<String, Object> applyComment(
-            Map<String, Object> op,
-            Map<String, HighFunction> liveHfCache,
-            Map<String, Map<String, String>> varRenameAliases) throws Exception {
+    private Map<String, Object> applyComment(Map<String, Object> op, BatchVars vars) throws Exception {
         String ctype = ApiError.optStr(op, "comment_type");
         if (ctype == null) ctype = "function";
         String target = ApiError.reqStr(op, "target");
@@ -857,11 +992,11 @@ final class EditService {
             Function fn = ws.resolveFunction(target);
             String fnAddr = fn.getEntryPoint().toString();
             String requestedVar = ApiError.reqStr(op, "var_name");
-            String effectiveVar = varRenameAliases.getOrDefault(fnAddr, Map.of()).getOrDefault(requestedVar, requestedVar);
-            VarHandle vh = resolveVar(fn, effectiveVar, liveHfCache);
+            VarHandle vh = resolveVar(fn, requestedVar, vars);
             String old = vh.comment();
+            boolean unstored = vh.unstored();
             vh.setComment(normalizedText);
-            liveHfCache.remove(fnAddr);
+            if (unstored) return resetVarOp(fnAddr, vh.name(), vh.name());
             return Map.of("op", "set_comment", "comment_type", "var", "target", fnAddr,
                     "var_name", vh.name(), "text", old == null ? "" : old);
         }
@@ -888,29 +1023,81 @@ final class EditService {
                 "text", old == null ? "" : old);
     }
 
-    private VarHandle resolveVar(Function fn, String varName, Map<String, HighFunction> cache) throws Exception {
-        for (Variable v : fn.getAllVariables()) {
-            if (v.getName().equals(varName)) return new DbVarHandle(v);
+    /** Records where each variable named by the batch lives, before any edit can rename it. */
+    private void snapshotVariables(List<Map<String, Object>> ops, PreResolution pre, BatchVars vars) throws Exception {
+        for (editIndex = 0; editIndex < ops.size(); editIndex++) {
+            Map<String, Object> op = ops.get(editIndex);
+            String kind = ApiError.reqStr(op, "op");
+            boolean varComment = "set_comment".equals(kind) && "var".equals(ApiError.optStr(op, "comment_type"));
+            if (!varComment && !"rename_var".equals(kind) && !"set_var_type".equals(kind)) continue;
+            Function fn = resolvePreFunction(ApiError.reqStr(op, varComment ? "target" : "function"), pre);
+            if (fn == null || vars.before.containsKey(fn.getEntryPoint().toString())) continue;
+
+            Map<String, VarIdentity> seen = new LinkedHashMap<>();
+            for (HighSymbol hs : localSymbols(fn)) seen.put(hs.getName(), VarIdentity.of(hs));
+            for (Variable v : fn.getAllVariables()) seen.putIfAbsent(v.getName(), null);
+            vars.before.put(fn.getEntryPoint().toString(), seen);
         }
+        editIndex = -1;
+    }
+
+    private Set<String> variableNames(Function fn) throws Exception {
+        Set<String> names = new HashSet<>();
+        for (HighSymbol hs : localSymbols(fn)) names.add(hs.getName());
+        for (Variable v : fn.getAllVariables()) names.add(v.getName());
+        return names;
+    }
+
+    private List<HighSymbol> localSymbols(Function fn) throws Exception {
+        var d = ws.decompileFresh(fn, DECOMPILE_TIMEOUT_SEC);
+        List<HighSymbol> out = new ArrayList<>();
+        if ("complete".equals(d.status()) && d.highFunction() != null
+                && d.highFunction().getLocalSymbolMap() != null) {
+            d.highFunction().getLocalSymbolMap().getSymbols().forEachRemaining(hs -> {
+                if (!hs.isGlobal()) out.add(hs);
+            });
+        }
+        return out;
+    }
+
+    /**
+     * A var_name means the variable the caller saw before the batch, or one the batch itself named.
+     * Decompiler names such as uVar1 move to other variables after an edit, so the variable itself is followed.
+     */
+    private VarHandle resolveVar(Function fn, String requested, BatchVars vars) throws Exception {
         String fnAddr = fn.getEntryPoint().toString();
-        HighFunction hf = cache.get(fnAddr);
-        if (hf == null) {
-            var d = ws.decompileFresh(fn, DECOMPILE_TIMEOUT_SEC);
-            if ("complete".equals(d.status()) && d.highFunction() != null) {
-                hf = d.highFunction();
-                cache.put(fnAddr, hf);
+        String renamed = vars.renamed.getOrDefault(fnAddr, Map.of()).get(requested);
+        Map<String, VarIdentity> seen = vars.before.get(fnAddr);
+        String name = renamed != null ? renamed : requested;
+        boolean declared = vars.declared.getOrDefault(fnAddr, Set.of()).contains(requested);
+        VarIdentity identity = renamed != null || declared || seen == null ? null : seen.get(requested);
+
+        if (identity != null) {
+            HighSymbol same = identity.findIn(localSymbols(fn));
+            // A name this batch already gave to a variable means two earlier variables have merged.
+            if (same == null || vars.renamed.getOrDefault(fnAddr, Map.of()).containsValue(same.getName())) {
+                throw new ApiError("VARIABLE_CHANGED", "Variable '" + requested + "' in " + fn.getName()
+                        + " was split, merged or removed by an earlier edit. Send that edit first, "
+                        + "decompile again, then edit this variable", null);
+            }
+            name = same.getName();
+        }
+        for (Variable v : fn.getAllVariables()) {
+            if (v.getName().equals(name)) return new DbVarHandle(v);
+        }
+        // A decompiler name the caller never saw (it appeared mid-batch) must not match.
+        boolean liveNameAllowed = seen == null || renamed != null || identity != null;
+        if (liveNameAllowed) {
+            for (HighSymbol hs : localSymbols(fn)) {
+                if (hs.getName().equals(name)) return new HighVarHandle(fn, hs);
             }
         }
-        if (hf != null && hf.getLocalSymbolMap() != null) {
-            Iterator<HighSymbol> it = hf.getLocalSymbolMap().getSymbols();
-            while (it.hasNext()) {
-                HighSymbol hs = it.next();
-                if (!hs.isGlobal() && hs.getName().equals(varName)) {
-                    return new HighVarHandle(fn, hs);
-                }
-            }
-        }
-        throw new ApiError("VARIABLE_NOT_FOUND", "Variable '" + varName + "' not found in " + fn.getName(), null);
+        List<String> available = seen != null
+                ? List.copyOf(seen.keySet())
+                : localSymbols(fn).stream().map(HighSymbol::getName).toList();
+        throw new ApiError("VARIABLE_NOT_FOUND", "Variable '" + requested + "' not found in " + fn.getName()
+                + (available.isEmpty() ? ", which has no variables" : ". Its variables are: "
+                        + String.join(", ", available)), null, Map.of("available_variables", available));
     }
 
     private GlobalHandle resolveGlobal(String target) {
@@ -958,8 +1145,16 @@ final class EditService {
                             "Ambiguous data type '" + typeSpec + "'; specify full path: " + paths, null);
                 }
             }
-            throw new ApiError("INVALID_TYPE", ex.getMessage() == null ? "Invalid data type: " + typeSpec : ex.getMessage(), null);
+            String message = ex.getMessage() == null ? "Invalid data type: " + typeSpec : ex.getMessage();
+            throw new ApiError("INVALID_TYPE", message + functionPointerHint(typeSpec), null);
         }
+    }
+
+    private static String functionPointerHint(String spec) {
+        return FUNCTION_POINTER_PATTERN.matcher(spec).find()
+                ? ". Inline function-pointer types are not supported: declare one with define_type, "
+                        + "e.g. 'typedef int (*main_fn)(int, char **);', then use the name main_fn"
+                : "";
     }
 
     private static int firstPtrOrArrayIndex(String s) {
@@ -1063,10 +1258,61 @@ final class EditService {
         final Map<String, Address> globalAliases = new HashMap<>();
     }
 
+    /**
+     * What makes a decompiler variable the same one after a re-decompile: its parameter slot, or the
+     * instructions that compute it, with storage to break ties and for variables no instruction computes.
+     */
+    private record VarIdentity(int parameter, Set<Address> definitions, Address storage, Address firstUse) {
+        static VarIdentity of(HighSymbol hs) {
+            if (hs.isParameter()) return new VarIdentity(hs.getCategoryIndex(), Set.of(), null, null);
+            Set<Address> definitions = new HashSet<>();
+            var variable = hs.getHighVariable();
+            if (variable != null) {
+                for (var instance : variable.getInstances()) {
+                    PcodeOp def = instance.getDef();
+                    // Merge and side-effect markers sit on addresses that many variables share.
+                    if (def != null && def.getOpcode() != PcodeOp.MULTIEQUAL && def.getOpcode() != PcodeOp.INDIRECT) {
+                        definitions.add(def.getSeqnum().getTarget());
+                    }
+                }
+            }
+            var storage = hs.getStorage();
+            var first = storage == null ? null : storage.getFirstVarnode();
+            return new VarIdentity(-1, definitions, first == null ? null : first.getAddress(), hs.getPCAddress());
+        }
+
+        /** The one symbol that is still this variable, or null when that is no longer certain. */
+        HighSymbol findIn(List<HighSymbol> symbols) {
+            List<HighSymbol> matches = symbols.stream().filter(hs -> {
+                VarIdentity other = of(hs);
+                if (parameter >= 0 || other.parameter >= 0) return parameter == other.parameter;
+                if (!definitions.isEmpty()) return !Collections.disjoint(definitions, other.definitions);
+                return Objects.equals(storage, other.storage) && Objects.equals(firstUse, other.firstUse);
+            }).toList();
+            if (matches.size() > 1) {
+                matches = matches.stream().filter(hs -> Objects.equals(storage, of(hs).storage)).toList();
+            }
+            return matches.size() == 1 ? matches.getFirst() : null;
+        }
+    }
+
+    private static final class BatchVars {
+        /** Off during revert, which only restores names that were valid before. */
+        boolean checkNames;
+        /** Function address to variable names before the batch; a null identity is a database-only variable. */
+        final Map<String, Map<String, VarIdentity>> before = new HashMap<>();
+        /** Function address to name used by the caller to the variable's current name. */
+        final Map<String, Map<String, String>> renamed = new HashMap<>();
+        /** Function address to parameter names set by a signature edit in this batch. */
+        final Map<String, Set<String>> declared = new HashMap<>();
+    }
+
     private interface VarHandle {
         String name();
         String dataTypePath();
         String comment();
+        /** True for a decompiler local that the program database does not hold yet. */
+        boolean unstored();
         void rename(String newName) throws Exception;
         void setType(DataType dt) throws Exception;
         void setComment(String text) throws Exception;
@@ -1076,6 +1322,7 @@ final class EditService {
         @Override public String name() { return v.getName(); }
         @Override public String dataTypePath() { return v.getDataType().getPathName(); }
         @Override public String comment() { return v.getComment(); }
+        @Override public boolean unstored() { return false; }
         @Override public void rename(String newName) throws Exception { v.setName(newName, SourceType.USER_DEFINED); }
         @Override public void setType(DataType dt) throws Exception { v.setDataType(dt, SourceType.USER_DEFINED); }
         @Override public void setComment(String text) { v.setComment(text); }
@@ -1092,6 +1339,11 @@ final class EditService {
 
         @Override public String name() { return hs.getName(); }
         @Override public String dataTypePath() { return hs.getDataType().getPathName(); }
+
+        @Override
+        public boolean unstored() {
+            return !hs.isParameter() && HighFunctionDBUtil.getFunctionVariable(hs) == null;
+        }
 
         @Override
         public String comment() {

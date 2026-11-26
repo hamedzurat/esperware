@@ -405,6 +405,124 @@ class HeadlessServerE2ETest {
     }
 
     @Test
+    void batchVariableNamesSurviveSignatureChangesAndFailuresNameTheEdit() throws Exception {
+        RunningServer srv = startServer("batch-vars", true);
+        StreamableMcpClient rw = new StreamableMcpClient(srv.baseUrl + "/mcp/rw", "main-rw");
+
+        // A function whose decompiler locals swap names once its signature is typed.
+        String addr = null;
+        String before = null;
+        var callAssignment = java.util.regex.Pattern.compile("\\b(uVar[12]) = FUN_\\w+\\(param_1,param_2\\)");
+        for (JsonElement el : rw.callOk("list_functions", Map.of("limit", 200)).getAsJsonArray("functions")) {
+            JsonObject f = el.getAsJsonObject();
+            if (f.get("external").getAsBoolean()) continue;
+            String candidate = f.get("address").getAsString();
+            String code = rw.callOk("decompile", Map.of("target", candidate)).get("pseudocode").getAsString();
+            if (code.contains("uVar1 = ") && code.contains("uVar2 = ") && callAssignment.matcher(code).find()) {
+                addr = candidate;
+                before = code;
+                break;
+            }
+        }
+        assertNotNull(addr, "Expected a function with two decompiler locals");
+        var found = callAssignment.matcher(before);
+        assertTrue(found.find());
+        String resultVar = found.group(1);
+        String otherVar = resultVar.equals("uVar1") ? "uVar2" : "uVar1";
+        Map<String, Object> signature = Map.of("op", "set_signature", "target", addr,
+                "signature", "uint32_t typed_fn(uint32_t a, int32_t b)");
+
+        var pointer = rw.callRaw("apply_edits", Map.of("expected_version", 0, "edits", List.of(signature,
+                Map.of("op", "set_signature", "target", addr, "signature", "void typed_fn(int (*cb)(int))"))));
+        assertTrue(pointer.isError());
+        JsonObject pointerError = pointer.body().getAsJsonObject("error");
+        assertEquals("INVALID_SIGNATURE", pointerError.get("code").getAsString());
+        assertEquals(1, pointerError.get("edit_index").getAsInt());
+        assertEquals("set_signature", pointerError.get("op").getAsString());
+        assertTrue(pointerError.get("message").getAsString().contains("define_type"), pointerError.toString());
+
+        var missing = rw.callRaw("apply_edits", Map.of("expected_version", 0, "edits", List.of(signature,
+                Map.of("op", "rename_var", "function", addr, "var_name", "no_such_var", "new_name", "x"))));
+        assertTrue(missing.isError());
+        JsonObject missingError = missing.body().getAsJsonObject("error");
+        assertEquals("VARIABLE_NOT_FOUND", missingError.get("code").getAsString());
+        assertEquals(1, missingError.get("edit_index").getAsInt());
+        assertTrue(missingError.getAsJsonArray("available_variables").toString().contains(resultVar),
+                missingError.toString());
+
+        // Names refer to the pre-batch decompile, in either order, although the signature edit renumbers them.
+        rw.callOk("apply_edits", Map.of("expected_version", 0, "edits", List.of(signature,
+                Map.of("op", "rename_var", "function", addr, "var_name", otherVar, "new_name", "other_value"),
+                Map.of("op", "rename_var", "function", addr, "var_name", resultVar, "new_name", "call_result"),
+                Map.of("op", "set_comment", "comment_type", "var", "target", addr,
+                        "var_name", resultVar, "text", "first call result"))));
+        JsonObject after = rw.callOk("decompile", Map.of("target", addr));
+        String afterCode = after.get("pseudocode").getAsString();
+        assertTrue(afterCode.matches("(?s).*\\bcall_result = FUN_\\w+\\(a,b\\).*"), afterCode);
+        assertTrue(afterCode.contains("other_value = "), afterCode);
+        for (JsonElement el : after.getAsJsonArray("variables")) {
+            JsonObject v = el.getAsJsonObject();
+            if ("call_result".equals(v.get("name").getAsString())) {
+                assertEquals("first call result", v.get("comment").getAsString());
+            }
+        }
+
+        rw.callOk("revert", Map.of("to_version", 0, "expected_version", 1));
+        assertEquals(before, rw.callOk("decompile", Map.of("target", addr)).get("pseudocode").getAsString());
+        // Reverting the revert brings the edits back.
+        rw.callOk("revert", Map.of("to_version", 1, "expected_version", 2));
+        assertEquals(afterCode, rw.callOk("decompile", Map.of("target", addr)).get("pseudocode").getAsString());
+        rw.callOk("revert", Map.of("to_version", 0, "expected_version", 3));
+        assertEquals(before, rw.callOk("decompile", Map.of("target", addr)).get("pseudocode").getAsString());
+
+        // Undoing a retype plus rename must bring back the automatic global name, not pin an old one.
+        String global = rw.callOk("decompile", Map.of("target", addr)).getAsJsonArray("globals")
+                .get(0).getAsJsonObject().get("address").getAsString();
+        rw.callOk("apply_edits", Map.of("expected_version", 4, "edits", List.of(
+                Map.of("op", "set_global_type", "target", global, "type", "ulonglong", "allow_resize", true),
+                Map.of("op", "rename_global", "target", global, "new_name", "g_wide"))));
+        rw.callOk("revert", Map.of("to_version", 4, "expected_version", 5));
+        assertEquals(before, rw.callOk("decompile", Map.of("target", addr)).get("pseudocode").getAsString());
+
+        // Undoing create_function must not leave the function's name behind as a label.
+        String mainAddr = null;
+        for (JsonElement el : rw.callOk("disassemble", Map.of("target", "entry", "max_instructions", 30))
+                .getAsJsonArray("instructions")) {
+            String operands = el.getAsJsonObject().get("operands").getAsString();
+            if (operands.startsWith("RDI,0x")) mainAddr = operands.substring("RDI,".length());
+        }
+        assertNotNull(mainAddr);
+        String entryBefore = rw.callOk("decompile", Map.of("target", "entry")).get("pseudocode").getAsString();
+        rw.callOk("apply_edits", Map.of("expected_version", 6, "edits", List.of(
+                Map.of("op", "create_function", "target", mainAddr, "name", "short_lived"))));
+        rw.callOk("revert", Map.of("to_version", 6, "expected_version", 7));
+        assertEquals(entryBefore, rw.callOk("decompile", Map.of("target", "entry")).get("pseudocode").getAsString());
+
+        // Errors say what went wrong and what to do; mistakes that used to succeed silently now fail.
+        assertErrorText(rw.callRaw("apply_edits", Map.of("expected_version", 0, "edits",
+                List.of(Map.of("op", "set_comment", "target", addr, "text", "x")))), "expected_version");
+        assertErrorText(rw.callRaw("apply_edits", Map.of("expected_version", 8, "edits",
+                List.of(Map.of("target", addr)))), "one of create_function");
+        assertErrorText(rw.callRaw("apply_edits", Map.of("expected_version", 8, "edits",
+                List.of(Map.of("op", "rename_var", "function", addr, "var_name", "uVar1", "new_name", "uVar2")))),
+                "already has a variable named 'uVar2'");
+        assertErrorText(rw.callRaw("decompile", Map.of("target", "no_such_fn")), "list_functions");
+        assertErrorText(rw.callRaw("decompile", Map.of("target", addr, "offset", 1_000_000)), "past the end");
+        assertErrorText(rw.callRaw("disassemble", Map.of("target", "0xdeadbeef")), "read_memory");
+        assertErrorText(rw.callRaw("define_type", Map.of("expected_version", 8, "c_declaration", "struct {")),
+                "C parse failed");
+        assertErrorText(rw.callRaw("define_type", Map.of("expected_version", 8, "c_declaration", "int x;")),
+                "typedef");
+        srv.shutdownAndAwait();
+    }
+
+    private static void assertErrorText(ToolCallResult result, String expected) {
+        assertTrue(result.isError(), result.body().toString());
+        String message = result.body().getAsJsonObject("error").get("message").getAsString();
+        assertTrue(message.contains(expected), message);
+    }
+
+    @Test
     void accessPolicyAndAcknowledgedEditsSurviveAnAbruptExit() throws Exception {
         String[] access = {"--rw-token", "e2e-write", "--ro-token", "e2e-read",
                 "--cors-origin", "http://localhost:9876"};
@@ -585,9 +703,6 @@ class HeadlessServerE2ETest {
         assertFalse(Files.exists(v0.resolve("src/_unmapped.c")));
         assertFalse(Files.exists(v0.resolve("src/_sec")));
         assertFalse(Files.exists(v0.resolve("src/_text")));
-        assertTrue(Files.isRegularFile(v0.resolve("src/001129.c")));
-        assertTrue(Files.isRegularFile(v0.resolve("src/001153.c")));
-        assertTrue(Files.isRegularFile(v0.resolve("src/00119a.c")));
         assertFalse(Files.exists(v0.resolve("types.json")));
         assertFalse(Files.exists(v0.resolve("source_map.jsonl")));
         assertFalse(Files.exists(v0.resolve("functions")));
@@ -599,11 +714,6 @@ class HeadlessServerE2ETest {
                 "types.h missing ProbeState");
         assertTrue(Files.readString(v0.resolve("symbols.json"), StandardCharsets.UTF_8).contains("probe_state"),
                 "symbols.json missing probe_state");
-
-        String mainSrc = Files.readString(v0.resolve("src/00119a.c"), StandardCharsets.UTF_8);
-        assertTrue(mainSrc.startsWith("#include \"../types.h\"\n"), mainSrc);
-        assertTrue(mainSrc.contains("int main("), mainSrc);
-        assertTrue(mainSrc.contains("readability-fixture.c:26-30"), mainSrc);
 
         Map<String, JsonObject> fnRows = new HashMap<>();
         Set<String> exportedSourceFiles = new HashSet<>();
@@ -629,18 +739,17 @@ class HeadlessServerE2ETest {
         for (String expectedFn : List.of("mix", "transform", "main")) {
             JsonObject row = fnRows.get(expectedFn);
             assertNotNull(row, "Missing function in functions.jsonl: " + expectedFn);
-            String expectedOffset = switch (expectedFn) {
-                case "mix" -> "001129";
-                case "transform" -> "001153";
-                case "main" -> "00119a";
-                default -> throw new AssertionError(expectedFn);
-            };
-            assertEquals(expectedOffset, row.get("entry_offset").getAsString());
-            assertEquals("src/" + expectedOffset + ".c", row.get("src_file").getAsString());
             assertEquals("complete", row.get("decompile_status").getAsString());
             assertTrue(row.getAsJsonArray("variables").size() > 0, "Expected variables for " + expectedFn);
             assertTrue(row.getAsJsonArray("lines").size() > 0, "Expected DWARF lines for " + expectedFn);
         }
+
+        // Addresses depend on the compiler that built the fixture, so file names come from the export itself.
+        String mainFile = fnRows.get("main").get("src_file").getAsString();
+        String mainSrc = Files.readString(v0.resolve(mainFile), StandardCharsets.UTF_8);
+        assertTrue(mainSrc.startsWith("#include \"../types.h\"\n"), mainSrc);
+        assertTrue(mainSrc.contains("int main("), mainSrc);
+        assertTrue(mainSrc.contains("readability-fixture.c:26-30"), mainSrc);
 
         boolean sawCallEdge = false;
         boolean sawDataEdge = false;
@@ -769,9 +878,9 @@ class HeadlessServerE2ETest {
         assertFalse(Files.exists(strippedV1.resolve("src/_unmapped.c")));
         assertTrue(Files.readString(strippedV1.resolve("functions.jsonl"), StandardCharsets.UTF_8).contains("mix_renamed"));
         assertTrue(Files.readString(strippedV1.resolve(expectedSrcFile), StandardCharsets.UTF_8).contains("mix_renamed"));
-        assertTrue(Files.isRegularFile(strippedV1.resolve("src/00119a.c")),
+        assertTrue(Files.isRegularFile(strippedV1.resolve(mainFile)),
                 "Expected export to recover main from the __libc_start_main callback");
-        assertTrue(Files.readString(strippedV1.resolve("src/00119a.c"), StandardCharsets.UTF_8).contains("main("));
+        assertTrue(Files.readString(strippedV1.resolve(mainFile), StandardCharsets.UTF_8).contains("main("));
         server.shutdownAndAwait("exp-rw");
     }
 

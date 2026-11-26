@@ -17,7 +17,7 @@ test:
 
 # Build container image from repository root
 image:
-    {{engine}} build -t {{image}} -f Dockerfile ..
+    {{engine}} build -t {{image}} -f Containerfile ..
 
 # Run container E2E test suite
 e2e:

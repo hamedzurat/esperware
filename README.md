@@ -29,6 +29,8 @@ Build the container image once:
 just image
 ```
 
+The build runs the unit and end-to-end tests. If any test fails, it produces no new image.
+
 Start a server with a binary. Install Python 3 and `jq` to use `just run` and `just resume`. `just run` tries ports above `32000` and prints the port when the server is ready. Use a different state directory for each running server.
 
 ```sh
